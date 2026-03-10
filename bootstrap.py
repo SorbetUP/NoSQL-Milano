@@ -18,7 +18,7 @@ ENV_PATH = ROOT / ".env"
 
 DEFAULT_ENV = {
     "COMPOSE_PROJECT_NAME": "nosql_milano",
-    "MONGO_PORT": "27017",
+    "MONGO_PORT": "27019",
     "MONGO_ROOT_USERNAME": "root",
     "MONGO_ROOT_PASSWORD": "root_password",
     "MONGO_APP_DB": "milano2026",
