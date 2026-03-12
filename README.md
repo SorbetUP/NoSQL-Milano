@@ -4,27 +4,51 @@ Version simple du projet avec une seule commande Python pour tout lancer.
 
 ## Fichiers utiles
 
-- `data/users.json`
-- `data/tweets.json`
-- `docker-compose.yml`
-- `bootstrap.py`
+- `src/docker/data/users.json`
+- `src/docker/data/tweets.json`
+- `src/docker/mongo/docker-compose.yml`
+- `src/docker/neo4j/docker-compose.yml`
+- `src/app_milano/main.py`
 - `.env`
 
 ## Installation
 
 ```bash
 python3 -m pip install -r requirements.txt
-python3 bootstrap.py
+python3 src/app_milano/main.py
 ```
 
-## Ce que fait `bootstrap.py`
+## Interface Streamlit
+
+```bash
+python3 src/app_milano/main.py
+```
+
+L'interface propose :
+
+- `Accueil` avec KPI et recherche centrale
+- `Top 10` pour tweets et hashtags
+- `Recherche` par utilisateur, hashtag ou texte
+- `Profil` utilisateur avec tweets recents
+- `Hashtag` avec resume et liste des tweets
+- `Reponses` pour afficher un tweet et ses reponses directes
+
+Quand une donnee n'est pas disponible ou pas encore branchee, l'interface affiche `...........`.
+
+Si tu veux relancer l'ancien bootstrap console :
+
+```bash
+python3 src/app_milano/main.py --cli
+```
+
+## Ce que fait `main.py`
 
 - verifie Docker
 - demarre MongoDB et Neo4j
 - attend que les deux bases soient pretes
 - cree la base MongoDB `milano2026`
 - cree les index MongoDB
-- importe `data/users.json` et `data/tweets.json`
+- importe `src/docker/data/users.json` et `src/docker/data/tweets.json`
 - cree les contraintes Neo4j
 - importe les noeuds `User` et `Tweet`
 - cree les relations `AUTHORED` et `REPLY_TO`
@@ -49,11 +73,12 @@ Password: neo4j_password
 
 ### SorbetUP / LemmingSnow
 
-- [x] mettre en place une premiere base du projet avec `.env`, `docker-compose.yml` et `bootstrap.py`
-- [x] preparer un dataset de travail dans `data/users.json` et `data/tweets.json`
-- [x] finaliser `bootstrap.py` pour qu'il serve d'entree principale stable du projet
+- [x] mettre en place une premiere base du projet avec `.env`, `docker-compose.yml` et `main.py`
+- [x] mettre en place une premiere base du projet avec `.env`, Docker et `main.py`
+- [x] preparer un dataset de travail dans `src/docker/data/users.json` et `src/docker/data/tweets.json`
+- [x] finaliser `src/app_milano/main.py` pour qu'il serve d'entree principale stable du projet
 - [x] relier proprement les parties MongoDB et Neo4j dans une execution unique
-- [ ] traiter les questions 1, 2, 3, 12 et 13
+- [x] traiter les questions 1, 2, 3, 12 et 13
 - [ ] verifier les sorties globales de l'application pour l'ensemble des questions
 - [ ] finaliser le `README` avec exemples d'execution et captures
 - [ ] faire les tests finaux et preparer la demo
@@ -61,9 +86,9 @@ Password: neo4j_password
 
 ### Kevin Zhang
 
-- [x] creer `mongo/import_data.py` pour l'import MongoDB
-- [x] implementer le CRUD MongoDB dans `mongo/crudfunc.py`
-- [ ] nettoyer et aligner `mongo/import_data.py` et `mongo/crudfunc.py` avec `.env` et le reste du projet
+- [x] creer `src/docker/mongo/import_data.py` pour l'import MongoDB
+- [x] implementer le CRUD MongoDB dans `src/docker/mongo/crudfunc.py`
+- [ ] nettoyer et aligner `src/docker/mongo/import_data.py` et `src/docker/mongo/crudfunc.py` avec `.env` et le reste du projet
 - [ ] traiter les questions 4, 5 et 6
 - [ ] produire les visualisations MongoDB : KPI, top hashtags, top tweets
 - [ ] rediger dans le rapport : modele MongoDB, CRUD, requetes MongoDB, agregations, visualisations MongoDB
