@@ -18,42 +18,6 @@ python3 -m pip install -r requirements.txt
 python3 src/app_milano/main.py
 ```
 
-## Interface Streamlit
-
-```bash
-python3 src/app_milano/main.py
-```
-
-L'interface propose :
-
-- `Accueil` avec KPI et recherche centrale
-- `Top 10` pour tweets et hashtags
-- `Recherche` par utilisateur, hashtag ou texte
-- `Profil` utilisateur avec tweets recents
-- `Hashtag` avec resume et liste des tweets
-- `Reponses` pour afficher un tweet et ses reponses directes
-
-Quand une donnee n'est pas disponible ou pas encore branchee, l'interface affiche `...........`.
-
-Si tu veux relancer l'ancien bootstrap console :
-
-```bash
-python3 src/app_milano/main.py --cli
-```
-
-## Ce que fait `main.py`
-
-- verifie Docker
-- demarre MongoDB et Neo4j
-- attend que les deux bases soient pretes
-- cree la base MongoDB `milano2026`
-- cree les index MongoDB
-- importe `src/docker/data/users.json` et `src/docker/data/tweets.json`
-- cree les contraintes Neo4j
-- importe les noeuds `User` et `Tweet`
-- cree les relations `AUTHORED` et `REPLY_TO`
-- affiche les infos de connexion
-
 ## Connexions
 
 MongoDB :
