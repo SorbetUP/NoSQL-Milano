@@ -51,8 +51,8 @@ Password: neo4j_password
 
 - [x] mettre en place une premiere base du projet avec `.env`, `docker-compose.yml` et `bootstrap.py`
 - [x] preparer un dataset de travail dans `data/users.json` et `data/tweets.json`
-- [ ] finaliser `bootstrap.py` pour qu'il serve d'entree principale stable du projet
-- [ ] relier proprement les parties MongoDB et Neo4j dans une execution unique
+- [x] finaliser `bootstrap.py` pour qu'il serve d'entree principale stable du projet
+- [x] relier proprement les parties MongoDB et Neo4j dans une execution unique
 - [ ] traiter les questions 1, 2, 3, 12 et 13
 - [ ] verifier les sorties globales de l'application pour l'ensemble des questions
 - [ ] finaliser le `README` avec exemples d'execution et captures
