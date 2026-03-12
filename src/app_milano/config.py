@@ -1,12 +1,11 @@
-from __future__ import annotations
-
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DATA_DIR = ROOT / "data"
+DATA_DIR = ROOT / "src" / "docker" / "data"
+ENV_PATH = ROOT / ".env"
 
 
 @dataclass(frozen=True)
@@ -51,6 +50,21 @@ def require_env(name: str) -> str:
     if not value:
         raise SystemExit(f"La variable d'environnement {name} est manquante.")
     return value
+
+
+def load_env_file(required=True):
+    if not ENV_PATH.exists():
+        if required:
+            raise SystemExit("Le fichier .env est manquant.")
+        return False
+
+    for line in ENV_PATH.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        os.environ[key.strip()] = value.strip()
+    return True
 
 
 def load_settings() -> Settings:

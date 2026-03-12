@@ -1,24 +1,11 @@
-from __future__ import annotations
-
 import json
 import time
-from dataclasses import dataclass
-from typing import Any
 
 from pymongo import ASCENDING, DESCENDING, MongoClient
 from pymongo.database import Database
 from pymongo.errors import PyMongoError
 
-from .config import DATA_DIR, Settings
-
-
-@dataclass(frozen=True)
-class MongoQuestionResults:
-    user_count: int
-    tweet_count: int
-    distinct_hashtag_count: int
-    top_tweets: list[dict[str, Any]]
-    top_hashtags: list[dict[str, Any]]
+from app_milano.config import DATA_DIR, Settings
 
 
 def wait_for_mongo(uri: str, timeout: int = 90) -> MongoClient:
@@ -33,7 +20,7 @@ def wait_for_mongo(uri: str, timeout: int = 90) -> MongoClient:
     raise SystemExit("MongoDB n'est pas pret apres 90 secondes.")
 
 
-def load_dataset() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def load_dataset() -> tuple[list[dict], list[dict]]:
     users = json.loads((DATA_DIR / "users.json").read_text(encoding="utf-8"))
     tweets = json.loads((DATA_DIR / "tweets.json").read_text(encoding="utf-8"))
     return users, tweets
@@ -85,14 +72,17 @@ def get_database(client: MongoClient, settings: Settings) -> Database:
     return client[settings.mongo_app_db]
 
 
+# Question 1: nombre total d'utilisateurs
 def count_users(db: Database) -> int:
     return db.users.count_documents({})
 
 
+# Question 2: nombre total de tweets
 def count_tweets(db: Database) -> int:
     return db.tweets.count_documents({})
 
 
+# Question 3: nombre total de hashtags distincts
 def count_distinct_hashtags(db: Database) -> int:
     result = list(
         db.tweets.aggregate(
@@ -105,8 +95,22 @@ def count_distinct_hashtags(db: Database) -> int:
     )
     return result[0]["count"] if result else 0
 
+# Question 4: nombre de tweets contenant un hashtag donne
+def count_tweets_with_hashtag(db: Database, hashtag: str) -> int:
+    pass
 
-def get_top_tweets(db: Database) -> list[dict[str, Any]]:
+
+# Question 5: nombre d'utilisateurs distincts ayant tweeté avec un hashtag donne
+def count_users_who_tweeted_hashtag(db: Database, hashtag: str) -> int:
+    pass
+
+
+# Question 6: tweets qui sont des reponses a un autre tweet
+def get_reply_tweets(db: Database) -> list[dict]:
+    pass
+
+# Question 12: top 10 tweets les plus populaires
+def get_top_tweets(db: Database) -> list[dict]:
     return list(
         db.tweets.aggregate(
             [
@@ -124,8 +128,12 @@ def get_top_tweets(db: Database) -> list[dict[str, Any]]:
                     "$project": {
                         "_id": 0,
                         "tweet_id": 1,
+                        "user_id": 1,
                         "favorite_count": 1,
                         "text": 1,
+                        "hashtags": 1,
+                        "created_at": 1,
+                        "in_reply_to_tweet_id": 1,
                         "username": {"$arrayElemAt": ["$author.username", 0]},
                     }
                 },
@@ -134,7 +142,8 @@ def get_top_tweets(db: Database) -> list[dict[str, Any]]:
     )
 
 
-def get_top_hashtags(db: Database) -> list[dict[str, Any]]:
+# Question 13: top 10 hashtags les plus populaires
+def get_top_hashtags(db: Database) -> list[dict]:
     return list(
         db.tweets.aggregate(
             [
@@ -145,30 +154,4 @@ def get_top_hashtags(db: Database) -> list[dict[str, Any]]:
                 {"$project": {"_id": 0, "hashtag": "$_id", "tweet_count": 1}},
             ]
         )
-    )
-
-
-# Question 4: nombre de tweets contenant un hashtag donne
-def count_tweets_with_hashtag(db: Database, hashtag: str) -> int:
-    pass
-
-
-# Question 5: nombre d'utilisateurs distincts ayant tweeté avec un hashtag donne
-def count_users_who_tweeted_hashtag(db: Database, hashtag: str) -> int:
-    pass
-
-
-# Question 6: tweets qui sont des reponses a un autre tweet
-def get_reply_tweets(db: Database) -> list[dict[str, Any]]:
-    pass
-
-
-def run_questions(client: MongoClient, settings: Settings) -> MongoQuestionResults:
-    db = get_database(client, settings)
-    return MongoQuestionResults(
-        user_count=count_users(db),
-        tweet_count=count_tweets(db),
-        distinct_hashtag_count=count_distinct_hashtags(db),
-        top_tweets=get_top_tweets(db),
-        top_hashtags=get_top_hashtags(db),
     )

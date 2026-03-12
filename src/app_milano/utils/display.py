@@ -1,0 +1,1459 @@
+import atexit
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from collections import defaultdict
+from pathlib import Path
+
+import streamlit as st
+import webview
+from pymongo import MongoClient
+from streamlit.runtime.scriptrunner_utils.script_run_context import get_script_run_ctx
+
+
+SRC_DIR = Path(__file__).resolve().parents[2]
+ROOT = SRC_DIR.parent
+
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from app_milano.config import DATA_DIR, Settings, load_env_file, load_settings
+from app_milano.utils.mongo import (
+    count_distinct_hashtags,
+    count_tweets,
+    count_users,
+    get_top_hashtags,
+    get_top_tweets,
+)
+
+
+PLACEHOLDER = "in progress"
+ROUTES = ["Accueil", "Top 10", "Recherche", "Profil", "Hashtag", "Reponses"]
+
+
+def print_connection_info(settings: Settings) -> None:
+    print("Execution terminee.")
+    print()
+    print("MongoDB")
+    print(settings.mongo_app_uri)
+    print()
+    print("Neo4j")
+    print(f"Browser: {settings.neo4j_browser_url}")
+    print(f"Bolt: {settings.neo4j_bolt_uri}")
+    print(f"User: {settings.neo4j_user}")
+    print(f"Password: {settings.neo4j_password}")
+
+
+def print_question_results(results: dict) -> None:
+    print()
+    print("Questions MongoDB")
+    print(f"Q1 - Nombre d'utilisateurs : {results['user_count']}")
+    print(f"Q2 - Nombre de tweets : {results['tweet_count']}")
+    print(f"Q3 - Nombre de hashtags distincts : {results['distinct_hashtag_count']}")
+
+    print()
+    print("Q12 - Top 10 tweets les plus populaires")
+    for index, tweet in enumerate(results["top_tweets"], start=1):
+        text = " ".join(tweet["text"].split())
+        preview = text[:90] + ("..." if len(text) > 90 else "")
+        print(
+            f"{index}. {tweet['tweet_id']} | @{tweet.get('username', 'unknown')} | "
+            f"{tweet['favorite_count']} likes | {preview}"
+        )
+
+    print()
+    print("Q13 - Top 10 hashtags les plus populaires")
+    for index, hashtag in enumerate(results["top_hashtags"], start=1):
+        print(f"{index}. #{hashtag['hashtag']} | {hashtag['tweet_count']} tweets")
+
+
+def init_state():
+    defaults = {
+        "route": "Accueil",
+        "selected_user_id": "",
+        "selected_username": "",
+        "selected_hashtag": "",
+        "selected_tweet_id": "",
+        "search_mode": "Utilisateur",
+        "search_query": "",
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def set_route(route):
+    st.session_state.route = route
+
+
+def open_profile(user_id="", username=""):
+    st.session_state.selected_user_id = user_id or ""
+    st.session_state.selected_username = username or ""
+    st.session_state.route = "Profil"
+
+
+def open_hashtag(hashtag):
+    st.session_state.selected_hashtag = hashtag or ""
+    st.session_state.route = "Hashtag"
+
+
+def open_replies(tweet_id):
+    st.session_state.selected_tweet_id = tweet_id or ""
+    st.session_state.route = "Reponses"
+
+
+def open_search(mode, query):
+    st.session_state.search_mode = mode
+    st.session_state.search_query = query or ""
+    st.session_state.route = "Recherche"
+
+
+class MilanoRepository:
+    def __init__(self):
+        self.source = "JSON local"
+        self.client = None
+        self.db = None
+        self.settings = None
+        self.users, self.tweets = self._load_dataset()
+        self.users_by_id = {user["user_id"]: user for user in self.users}
+        self.users_by_username = {user["username"].lower(): user for user in self.users}
+        self._connect_mongo()
+
+    def _load_dataset(self):
+        users = json.loads((DATA_DIR / "users.json").read_text(encoding="utf-8"))
+        tweets = json.loads((DATA_DIR / "tweets.json").read_text(encoding="utf-8"))
+        return users, tweets
+
+    def _connect_mongo(self):
+        if not load_env_file(required=False):
+            return
+
+        try:
+            self.settings = load_settings()
+            self.client = MongoClient(self.settings.mongo_app_uri, serverSelectionTimeoutMS=2500)
+            self.client.admin.command("ping")
+            self.db = self.client[self.settings.mongo_app_db]
+            self.source = "MongoDB"
+        except Exception:
+            if self.client:
+                self.client.close()
+            self.client = None
+            self.db = None
+            self.settings = None
+            self.source = "JSON local"
+
+    def close(self):
+        if self.client:
+            self.client.close()
+
+    def _clean_doc(self, doc):
+        if not doc:
+            return None
+        cleaned = dict(doc)
+        cleaned.pop("_id", None)
+        return cleaned
+
+    def _normalize_hashtag(self, hashtag):
+        return hashtag.strip().lstrip("#").lower()
+
+    def _attach_username(self, tweet):
+        if not tweet:
+            return None
+        enriched = dict(tweet)
+        if not enriched.get("username"):
+            user = self.users_by_id.get(enriched.get("user_id"), {})
+            enriched["username"] = user.get("username", "unknown")
+        return enriched
+
+    def _sort_by_created_at(self, rows, reverse=False):
+        return sorted(rows, key=lambda item: (item.get("created_at", ""), item.get("tweet_id", "")), reverse=reverse)
+
+    def get_kpis(self):
+        if self.db is not None:
+            return {
+                "user_count": count_users(self.db),
+                "tweet_count": count_tweets(self.db),
+                "distinct_hashtag_count": count_distinct_hashtags(self.db),
+            }
+
+        hashtags = set()
+        for tweet in self.tweets:
+            for hashtag in tweet.get("hashtags", []):
+                hashtags.add(hashtag)
+
+        return {
+            "user_count": len(self.users),
+            "tweet_count": len(self.tweets),
+            "distinct_hashtag_count": len(hashtags),
+        }
+
+    def get_top_tweets(self):
+        if self.db is not None:
+            return get_top_tweets(self.db)
+
+        tweets = []
+        for tweet in self._sort_by_created_at(self.tweets, reverse=True):
+            tweets.append(self._attach_username(tweet))
+        tweets = sorted(tweets, key=lambda item: (-item.get("favorite_count", 0), item.get("tweet_id", "")))
+        return tweets[:10]
+
+    def get_top_hashtags(self):
+        if self.db is not None:
+            return get_top_hashtags(self.db)
+
+        counts = {}
+        for tweet in self.tweets:
+            for hashtag in tweet.get("hashtags", []):
+                counts[hashtag] = counts.get(hashtag, 0) + 1
+
+        rows = []
+        for hashtag, total in counts.items():
+            rows.append({"hashtag": hashtag, "tweet_count": total})
+        return sorted(rows, key=lambda item: (-item["tweet_count"], item["hashtag"]))[:10]
+
+    def get_activity_series(self, limit=7):
+        if self.db is not None:
+            rows = list(
+                self.db.tweets.aggregate(
+                    [
+                        {"$group": {"_id": {"$substr": ["$created_at", 0, 10]}, "tweet_count": {"$sum": 1}}},
+                        {"$sort": {"_id": 1}},
+                    ]
+                )
+            )
+            rows = [{"day": row["_id"], "tweet_count": row["tweet_count"]} for row in rows]
+        else:
+            counts = defaultdict(int)
+            for tweet in self.tweets:
+                counts[tweet.get("created_at", "")[:10]] += 1
+            rows = [{"day": day, "tweet_count": count} for day, count in sorted(counts.items())]
+
+        return rows[-limit:]
+
+    def get_featured_users(self, limit=4):
+        if self.db is not None:
+            rows = list(
+                self.db.tweets.aggregate(
+                    [
+                        {
+                            "$group": {
+                                "_id": "$user_id",
+                                "tweet_count": {"$sum": 1},
+                                "favorite_total": {"$sum": "$favorite_count"},
+                            }
+                        },
+                        {"$sort": {"tweet_count": -1, "favorite_total": -1, "_id": 1}},
+                        {"$limit": limit},
+                        {
+                            "$lookup": {
+                                "from": "users",
+                                "localField": "_id",
+                                "foreignField": "user_id",
+                                "as": "profile",
+                            }
+                        },
+                        {
+                            "$project": {
+                                "_id": 0,
+                                "user_id": "$_id",
+                                "tweet_count": 1,
+                                "favorite_total": 1,
+                                "username": {"$arrayElemAt": ["$profile.username", 0]},
+                                "role": {"$arrayElemAt": ["$profile.role", 0]},
+                                "country": {"$arrayElemAt": ["$profile.country", 0]},
+                            }
+                        },
+                    ]
+                )
+            )
+            return rows
+
+        counts = defaultdict(lambda: {"tweet_count": 0, "favorite_total": 0})
+        for tweet in self.tweets:
+            user_id = tweet.get("user_id")
+            counts[user_id]["tweet_count"] += 1
+            counts[user_id]["favorite_total"] += tweet.get("favorite_count", 0)
+
+        rows = []
+        for user_id, totals in counts.items():
+            profile = self.users_by_id.get(user_id, {})
+            rows.append(
+                {
+                    "user_id": user_id,
+                    "username": profile.get("username", "unknown"),
+                    "role": profile.get("role", PLACEHOLDER),
+                    "country": profile.get("country", PLACEHOLDER),
+                    "tweet_count": totals["tweet_count"],
+                    "favorite_total": totals["favorite_total"],
+                }
+            )
+
+        return sorted(rows, key=lambda item: (-item["tweet_count"], -item["favorite_total"], item["username"]))[:limit]
+
+    def search_users(self, query, limit=12):
+        query = query.strip()
+        if not query:
+            return []
+
+        if self.db is not None:
+            cursor = (
+                self.db.users.find({"username": {"$regex": re.escape(query), "$options": "i"}}, {"_id": 0})
+                .sort("username", 1)
+                .limit(limit)
+            )
+            return [self._clean_doc(row) for row in cursor]
+
+        results = []
+        needle = query.lower()
+        for user in self.users:
+            if needle in user.get("username", "").lower():
+                results.append(dict(user))
+        return sorted(results, key=lambda item: item["username"])[:limit]
+
+    def search_hashtags(self, query, limit=12):
+        query = self._normalize_hashtag(query)
+        if not query:
+            return []
+
+        if self.db is not None:
+            rows = list(
+                self.db.tweets.aggregate(
+                    [
+                        {"$unwind": "$hashtags"},
+                        {"$match": {"hashtags": {"$regex": re.escape(query), "$options": "i"}}},
+                        {"$group": {"_id": "$hashtags", "tweet_count": {"$sum": 1}}},
+                        {"$sort": {"tweet_count": -1, "_id": 1}},
+                        {"$limit": limit},
+                        {"$project": {"_id": 0, "hashtag": "$_id", "tweet_count": 1}},
+                    ]
+                )
+            )
+            return rows
+
+        counts = {}
+        for tweet in self.tweets:
+            for hashtag in tweet.get("hashtags", []):
+                if query in hashtag.lower():
+                    counts[hashtag] = counts.get(hashtag, 0) + 1
+
+        rows = []
+        for hashtag, total in counts.items():
+            rows.append({"hashtag": hashtag, "tweet_count": total})
+        return sorted(rows, key=lambda item: (-item["tweet_count"], item["hashtag"]))[:limit]
+
+    def search_tweets_by_text(self, query, limit=20):
+        query = query.strip()
+        if not query:
+            return []
+
+        if self.db is not None:
+            rows = list(
+                self.db.tweets.aggregate(
+                    [
+                        {"$match": {"text": {"$regex": re.escape(query), "$options": "i"}}},
+                        {"$sort": {"created_at": -1, "tweet_id": 1}},
+                        {"$limit": limit},
+                        {
+                            "$lookup": {
+                                "from": "users",
+                                "localField": "user_id",
+                                "foreignField": "user_id",
+                                "as": "author",
+                            }
+                        },
+                        {
+                            "$project": {
+                                "_id": 0,
+                                "tweet_id": 1,
+                                "user_id": 1,
+                                "text": 1,
+                                "hashtags": 1,
+                                "created_at": 1,
+                                "favorite_count": 1,
+                                "in_reply_to_tweet_id": 1,
+                                "username": {"$arrayElemAt": ["$author.username", 0]},
+                            }
+                        },
+                    ]
+                )
+            )
+            return rows
+
+        needle = query.lower()
+        rows = []
+        for tweet in self.tweets:
+            if needle in tweet.get("text", "").lower():
+                rows.append(self._attach_username(tweet))
+        return self._sort_by_created_at(rows, reverse=True)[:limit]
+
+    def get_user_by_username(self, username):
+        if not username:
+            return None
+
+        if self.db is not None:
+            row = self.db.users.find_one(
+                {"username": {"$regex": f"^{re.escape(username)}$", "$options": "i"}},
+                {"_id": 0},
+            )
+            return self._clean_doc(row)
+
+        return self.users_by_username.get(username.lower())
+
+    def get_user_by_id(self, user_id):
+        if not user_id:
+            return None
+
+        if self.db is not None:
+            row = self.db.users.find_one({"user_id": user_id}, {"_id": 0})
+            return self._clean_doc(row)
+
+        return self.users_by_id.get(user_id)
+
+    def get_tweets_by_user(self, user_id, limit=20):
+        if not user_id:
+            return []
+
+        if self.db is not None:
+            cursor = self.db.tweets.find({"user_id": user_id}, {"_id": 0}).sort("created_at", -1).limit(limit)
+            rows = [self._clean_doc(row) for row in cursor]
+            return [self._attach_username(row) for row in rows]
+
+        rows = [self._attach_username(tweet) for tweet in self.tweets if tweet.get("user_id") == user_id]
+        return self._sort_by_created_at(rows, reverse=True)[:limit]
+
+    def get_hashtag_summary(self, hashtag):
+        normalized = self._normalize_hashtag(hashtag)
+        if not normalized:
+            return None
+
+        if self.db is not None:
+            rows = list(
+                self.db.tweets.aggregate(
+                    [
+                        {"$match": {"hashtags": normalized}},
+                        {
+                            "$group": {
+                                "_id": None,
+                                "tweet_count": {"$sum": 1},
+                                "user_ids": {"$addToSet": "$user_id"},
+                            }
+                        },
+                        {
+                            "$project": {
+                                "_id": 0,
+                                "hashtag": normalized,
+                                "tweet_count": 1,
+                                "user_count": {"$size": "$user_ids"},
+                            }
+                        },
+                    ]
+                )
+            )
+            return rows[0] if rows else None
+
+        matching = [tweet for tweet in self.tweets if normalized in tweet.get("hashtags", [])]
+        if not matching:
+            return None
+
+        user_ids = set()
+        for tweet in matching:
+            user_ids.add(tweet.get("user_id"))
+
+        return {"hashtag": normalized, "tweet_count": len(matching), "user_count": len(user_ids)}
+
+    def get_tweets_by_hashtag(self, hashtag, limit=30):
+        normalized = self._normalize_hashtag(hashtag)
+        if not normalized:
+            return []
+
+        if self.db is not None:
+            rows = list(
+                self.db.tweets.aggregate(
+                    [
+                        {"$match": {"hashtags": normalized}},
+                        {"$sort": {"created_at": -1, "tweet_id": 1}},
+                        {"$limit": limit},
+                        {
+                            "$lookup": {
+                                "from": "users",
+                                "localField": "user_id",
+                                "foreignField": "user_id",
+                                "as": "author",
+                            }
+                        },
+                        {
+                            "$project": {
+                                "_id": 0,
+                                "tweet_id": 1,
+                                "user_id": 1,
+                                "text": 1,
+                                "hashtags": 1,
+                                "created_at": 1,
+                                "favorite_count": 1,
+                                "in_reply_to_tweet_id": 1,
+                                "username": {"$arrayElemAt": ["$author.username", 0]},
+                            }
+                        },
+                    ]
+                )
+            )
+            return rows
+
+        rows = []
+        for tweet in self.tweets:
+            if normalized in tweet.get("hashtags", []):
+                rows.append(self._attach_username(tweet))
+        return self._sort_by_created_at(rows, reverse=True)[:limit]
+
+    def get_tweet_by_id(self, tweet_id):
+        if not tweet_id:
+            return None
+
+        if self.db is not None:
+            row = self.db.tweets.find_one({"tweet_id": tweet_id}, {"_id": 0})
+            return self._attach_username(self._clean_doc(row))
+
+        for tweet in self.tweets:
+            if tweet.get("tweet_id") == tweet_id:
+                return self._attach_username(tweet)
+        return None
+
+    def get_parent_tweet(self, tweet):
+        if not tweet:
+            return None
+        return self.get_tweet_by_id(tweet.get("in_reply_to_tweet_id"))
+
+    def get_replies_for_tweet(self, tweet_id, limit=30):
+        if not tweet_id:
+            return []
+
+        if self.db is not None:
+            rows = list(
+                self.db.tweets.aggregate(
+                    [
+                        {"$match": {"in_reply_to_tweet_id": tweet_id}},
+                        {"$sort": {"created_at": 1, "tweet_id": 1}},
+                        {"$limit": limit},
+                        {
+                            "$lookup": {
+                                "from": "users",
+                                "localField": "user_id",
+                                "foreignField": "user_id",
+                                "as": "author",
+                            }
+                        },
+                        {
+                            "$project": {
+                                "_id": 0,
+                                "tweet_id": 1,
+                                "user_id": 1,
+                                "text": 1,
+                                "hashtags": 1,
+                                "created_at": 1,
+                                "favorite_count": 1,
+                                "in_reply_to_tweet_id": 1,
+                                "username": {"$arrayElemAt": ["$author.username", 0]},
+                            }
+                        },
+                    ]
+                )
+            )
+            return rows
+
+        rows = []
+        for tweet in self.tweets:
+            if tweet.get("in_reply_to_tweet_id") == tweet_id:
+                rows.append(self._attach_username(tweet))
+        return self._sort_by_created_at(rows)[:limit]
+
+
+def find_free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def wait_for_server(url, timeout=30):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=2):
+                return
+        except Exception:
+            time.sleep(0.5)
+    raise SystemExit("L'interface Streamlit n'a pas demarre a temps.")
+
+
+def launch_desktop():
+    port = find_free_port()
+    url = f"http://127.0.0.1:{port}"
+    env = os.environ.copy()
+    env["APP_MILANO_UI_MODE"] = "desktop"
+    streamlit_app = ROOT / "src" / "app_milano" / "utils" / "display.py"
+
+    command = [
+        sys.executable,
+        "-m",
+        "streamlit",
+        "run",
+        str(streamlit_app),
+        "--server.headless",
+        "true",
+        "--server.port",
+        str(port),
+        "--browser.gatherUsageStats",
+        "false",
+    ]
+
+    process = subprocess.Popen(
+        command,
+        cwd=ROOT,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    def cleanup():
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+
+    atexit.register(cleanup)
+    wait_for_server(url)
+
+    webview.create_window(
+        "Milano Interface",
+        url,
+        width=1480,
+        height=920,
+        min_size=(1080, 720),
+        text_select=True,
+        background_color="#eef3f7",
+    )
+    webview.start()
+
+
+def apply_styles(dev_mode=True):
+    sidebar_rules = """
+        [data-testid="stSidebar"] {
+            background: linear-gradient(180deg, #19324a 0%, #284e68 100%);
+        }
+        [data-testid="stSidebar"] * {
+            color: #f7f2e8 !important;
+        }
+    """
+    if not dev_mode:
+        sidebar_rules = """
+        [data-testid="stSidebar"] { display: none; }
+        [data-testid="collapsedControl"] { display: none; }
+        [data-testid="stHeader"] { display: none; }
+        [data-testid="stToolbar"] { display: none; }
+        [data-testid="stDecoration"] { display: none; }
+        [data-testid="stStatusWidget"] { display: none; }
+        #MainMenu { display: none; }
+        header { display: none; }
+        """
+
+    styles = """
+        <style>
+        .block-container {
+            max-width: 1380px;
+            padding-top: 0.6rem;
+            padding-bottom: 2rem;
+        }
+        .stApp {
+            background: #eef2f6;
+            color: #22324b;
+            font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+        }
+        __SIDEBAR_RULES__
+        .stButton > button {
+            border-radius: 999px;
+            border: 0;
+            background: #6a98f5;
+            color: white;
+            font-weight: 700;
+            min-height: 2.6rem;
+            box-shadow: 0 10px 24px rgba(92, 140, 255, 0.22);
+        }
+        .stButton > button:hover {
+            color: white;
+            border: 0;
+            background: #5a87e1;
+        }
+        .stTextInput input, .stSelectbox div[data-baseweb="select"] > div, .stTextInput textarea {
+            border-radius: 16px !important;
+            border: 1px solid rgba(34,50,75,0.08) !important;
+            background: rgba(255,255,255,0.92) !important;
+        }
+        div[data-baseweb="select"] {
+            border-radius: 16px;
+        }
+        .stRadio [role="radiogroup"] {
+            gap: 0.75rem;
+        }
+        .milano-title {
+            font-size: 2.3rem;
+            font-weight: 800;
+            letter-spacing: 0.04em;
+            color: #263955;
+            margin-bottom: 0.15rem;
+        }
+        .milano-subtitle {
+            color: #6f7f95;
+            margin-bottom: 1rem;
+        }
+        .milano-card {
+            background: rgba(255,255,255,0.95);
+            border: 1px solid rgba(34,50,75,0.07);
+            border-radius: 24px;
+            padding: 1rem 1rem 0.9rem 1rem;
+            box-shadow: 0 18px 36px rgba(28, 39, 60, 0.08);
+            min-height: 140px;
+            margin-bottom: 0.9rem;
+        }
+        .milano-shell {
+            background: rgba(255,255,255,0.72);
+            border: 1px solid rgba(34,50,75,0.06);
+            border-radius: 30px;
+            box-shadow: 0 20px 50px rgba(32, 42, 68, 0.10);
+            padding: 1.25rem;
+            backdrop-filter: blur(10px);
+        }
+        .milano-topbar {
+            background: rgba(255,255,255,0.92);
+            border: 1px solid rgba(34,50,75,0.06);
+            border-radius: 24px;
+            padding: 0.9rem 1rem 1rem 1rem;
+            margin-bottom: 0.8rem;
+        }
+        .milano-badge {
+            display: inline-block;
+            padding: 0.35rem 0.75rem;
+            border-radius: 999px;
+            background: rgba(82, 197, 190, 0.12);
+            color: #2f7d78;
+            font-size: 0.82rem;
+            font-weight: 700;
+            margin-left: 0.4rem;
+        }
+        .milano-metric {
+            border-radius: 26px;
+            padding: 1rem;
+            color: white;
+            box-shadow: 0 20px 38px rgba(52, 88, 163, 0.18);
+            min-height: 148px;
+            margin-bottom: 0.9rem;
+        }
+        .milano-metric.aqua {
+            background: #6cb9f2;
+        }
+        .milano-metric.mint {
+            background: #5fd6bf;
+        }
+        .milano-metric.violet {
+            background: #8b73ef;
+        }
+        .milano-metric.indigo {
+            background: #6e95f5;
+        }
+        .milano-metric .metric-icon {
+            width: 42px;
+            height: 42px;
+            border-radius: 14px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: rgba(255,255,255,0.2);
+            font-size: 1.2rem;
+            margin-bottom: 1.2rem;
+        }
+        .milano-metric .metric-title {
+            font-size: 0.9rem;
+            opacity: 0.9;
+            margin-bottom: 0.3rem;
+        }
+        .milano-metric .metric-value {
+            font-size: 2rem;
+            font-weight: 800;
+            margin-bottom: 0.25rem;
+        }
+        .milano-metric .metric-note {
+            font-size: 0.85rem;
+            opacity: 0.92;
+        }
+        .milano-panel {
+            background: rgba(255,255,255,0.92);
+            border: 1px solid rgba(34,50,75,0.06);
+            border-radius: 24px;
+            padding: 1rem 1rem 0.8rem 1rem;
+            box-shadow: 0 16px 34px rgba(27, 42, 69, 0.08);
+            margin-bottom: 0.95rem;
+        }
+        .milano-mini-card {
+            background: rgba(246, 249, 252, 0.95);
+            border: 1px solid rgba(34,50,75,0.06);
+            border-radius: 18px;
+            padding: 0.9rem;
+            min-height: 128px;
+            margin-bottom: 0.85rem;
+        }
+        .milano-nav-wrap {
+            margin-bottom: 0.8rem;
+        }
+        .milano-eyebrow {
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            font-size: 0.72rem;
+            color: #7a8aa2;
+            margin-bottom: 0.35rem;
+        }
+        .milano-number {
+            font-size: 2rem;
+            font-weight: 800;
+            color: #263955;
+        }
+        .milano-panel-title {
+            font-size: 1.3rem;
+            font-weight: 800;
+            color: #24344e;
+            margin: 0.2rem 0 0.75rem 0;
+        }
+        .milano-muted {
+            color: #7b8a9e;
+        }
+        .milano-placeholder {
+            border: 2px dashed #b55d46;
+            background: rgba(181,93,70,0.08);
+            color: #8a3f2c;
+            border-radius: 14px;
+            padding: 0.85rem 1rem;
+            text-align: center;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+        }
+        .milano-tweet {
+            background: rgba(255,255,255,0.9);
+            border-left: 5px solid #52c5be;
+            border-radius: 18px;
+            padding: 0.9rem 1rem;
+            margin-bottom: 0.7rem;
+            box-shadow: 0 12px 22px rgba(25,50,74,0.05);
+        }
+        .milano-meta {
+            font-size: 0.85rem;
+            color: #536173;
+            margin-bottom: 0.4rem;
+        }
+        .milano-chip {
+            display: inline-block;
+            padding: 0.2rem 0.55rem;
+            margin-right: 0.35rem;
+            margin-bottom: 0.35rem;
+            border-radius: 999px;
+            background: rgba(29,53,87,0.08);
+            border: 1px solid rgba(29,53,87,0.18);
+            color: #1d3557;
+            font-size: 0.82rem;
+            font-weight: 700;
+        }
+        .milano-bar-row {
+            margin-bottom: 0.65rem;
+        }
+        .milano-bar-track {
+            width: 100%;
+            height: 12px;
+            background: rgba(29,53,87,0.10);
+            border-radius: 999px;
+            overflow: hidden;
+        }
+        .milano-bar-fill {
+            height: 12px;
+            border-radius: 999px;
+            background: linear-gradient(90deg, #1d3557 0%, #3e7c74 100%);
+        }
+        .milano-hero {
+            background: rgba(255,255,255,0.96);
+            border: 1px solid rgba(34,50,75,0.07);
+            border-radius: 24px;
+            padding: 1.1rem;
+            margin-bottom: 1rem;
+            box-shadow: 0 16px 34px rgba(27, 42, 69, 0.08);
+        }
+        .milano-divider {
+            height: 1px;
+            background: rgba(25,50,74,0.12);
+            margin: 0.8rem 0;
+        }
+        .milano-user-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.75rem;
+            padding: 0.8rem 0.1rem;
+            border-bottom: 1px solid rgba(34,50,75,0.06);
+        }
+        .milano-user-row:last-child {
+            border-bottom: 0;
+        }
+        .milano-avatar {
+            width: 42px;
+            height: 42px;
+            border-radius: 50%;
+            background: #7fa2f2;
+            color: white;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 800;
+        }
+        .milano-chip-soft {
+            display: inline-block;
+            padding: 0.3rem 0.7rem;
+            border-radius: 999px;
+            background: rgba(92, 140, 255, 0.08);
+            color: #4c63c7;
+            font-size: 0.8rem;
+            font-weight: 700;
+            margin-right: 0.35rem;
+            margin-bottom: 0.35rem;
+        }
+        .milano-label-row {
+            display: flex;
+            gap: 0.45rem;
+            flex-wrap: wrap;
+            margin-top: 0.6rem;
+        }
+        </style>
+    """.replace("__SIDEBAR_RULES__", sidebar_rules)
+    st.markdown(styles, unsafe_allow_html=True)
+
+
+def render_sidebar(repo, routes, current_route, on_route_change):
+    st.sidebar.markdown("## Milano")
+    st.sidebar.caption("Interface Streamlit inspiree du croquis.")
+    selected = st.sidebar.radio("Navigation", routes, index=routes.index(current_route))
+    if selected != current_route:
+        on_route_change(selected)
+    st.sidebar.markdown("---")
+    st.sidebar.caption(f"Source active : {repo.source}")
+    st.sidebar.caption("Si une donnee ou une question n'est pas encore finalisee, l'interface affiche `in progress`.")
+
+
+def render_page_nav(on_route_change, current_route):
+    st.markdown("<div class='milano-nav-wrap'>", unsafe_allow_html=True)
+    nav_cols = st.columns([0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 2.2])
+    labels = ["Accueil", "Top 10", "Recherche", "Profil", "Hashtag", "Reponses"]
+    for index, label in enumerate(labels):
+        button_label = label
+        if label == current_route:
+            button_label = f"• {label}"
+        if nav_cols[index].button(button_label, key=f"page-nav-{current_route}-{label}", use_container_width=True):
+            on_route_change(label)
+            st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_metric_card(title, value, note, variant, icon):
+    st.markdown(
+        f"""
+        <div class="milano-metric {variant}">
+            <div class="metric-icon">{icon}</div>
+            <div class="metric-title">{title}</div>
+            <div class="metric-value">{value}</div>
+            <div class="metric-note">{note}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+def render_placeholder(placeholder):
+    st.markdown(f"<div class='milano-placeholder'>{placeholder}</div>", unsafe_allow_html=True)
+
+
+def render_page_header(title, subtitle):
+    st.markdown(f"<div class='milano-title'>{title}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='milano-subtitle'>{subtitle}</div>", unsafe_allow_html=True)
+
+
+def render_card(title, value, note="", kind=""):
+    classes = "milano-card"
+    if kind:
+        classes += f" {kind}"
+    st.markdown(
+        f"""
+        <div class="{classes}">
+            <div class="milano-eyebrow">{title}</div>
+            <div class="milano-number">{value}</div>
+            <div class="milano-muted">{note}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_bar_rows(items, label_key, value_key, placeholder, on_click=None, key_prefix="bar"):
+    if items == placeholder:
+        render_placeholder(placeholder)
+        return
+
+    if not items:
+        st.caption("Aucun resultat.")
+        return
+
+    max_value = max(item.get(value_key, 0) for item in items) or 1
+    for index, item in enumerate(items, start=1):
+        label = item.get(label_key, placeholder)
+        value = item.get(value_key, placeholder)
+        width = 0
+        if isinstance(value, int):
+            width = max(8, int((value / max_value) * 100))
+
+        cols = st.columns([0.45, 2.6, 0.8, 0.9])
+        cols[0].markdown(f"**{index}.**")
+        cols[1].markdown(label)
+        if isinstance(value, int):
+            cols[2].markdown(
+                f"""
+                <div class="milano-bar-row">
+                    <div class="milano-bar-track">
+                        <div class="milano-bar-fill" style="width:{width}%"></div>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            cols[2].caption(str(value))
+        else:
+            cols[2].markdown(value)
+        if on_click:
+            if cols[3].button("Ouvrir", key=f"{key_prefix}-{index}-{label}"):
+                on_click(item)
+                st.rerun()
+
+
+def render_tweet_card(tweet, placeholder, on_open_profile, on_open_replies, key_prefix="tweet", show_reply_button=True):
+    if not tweet:
+        render_placeholder(placeholder)
+        return
+
+    hashtags = tweet.get("hashtags", [])
+    chips = "".join(f"<span class='milano-chip'>#{tag}</span>" for tag in hashtags[:5])
+    st.markdown(
+        f"""
+        <div class="milano-tweet">
+            <div class="milano-meta">@{tweet.get('username', 'unknown')} • {tweet.get('created_at', placeholder)} • {tweet.get('favorite_count', placeholder)} likes</div>
+            <div>{tweet.get('text', placeholder)}</div>
+            <div style="margin-top:0.55rem;">{chips}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    action_cols = st.columns([1, 1, 3])
+    if action_cols[0].button("Profil", key=f"{key_prefix}-profile-{tweet.get('tweet_id', 'x')}"):
+        on_open_profile(user_id=tweet.get("user_id", ""), username=tweet.get("username", ""))
+        st.rerun()
+    if show_reply_button and action_cols[1].button("Reponses", key=f"{key_prefix}-reply-{tweet.get('tweet_id', 'x')}"):
+        on_open_replies(tweet.get("tweet_id", ""))
+        st.rerun()
+
+
+def render_home(repo, placeholder, on_open_search, on_open_profile, on_open_hashtag, on_open_replies, on_route_change):
+    kpis = repo.get_kpis()
+    activity = repo.get_activity_series()
+    top_hashtags = repo.get_top_hashtags()[:4]
+
+    st.markdown("<div class='milano-shell'>", unsafe_allow_html=True)
+    st.markdown(
+        """
+        <div class="milano-topbar">
+            <div class="milano-eyebrow">Milano dashboard</div>
+        """,
+        unsafe_allow_html=True,
+    )
+    render_page_nav(on_route_change, "Accueil")
+    st.markdown(
+        """
+            <div>
+                <div class="milano-title" style="margin-bottom:0.1rem;">Control Board</div>
+                <div class="milano-subtitle" style="margin-bottom:0;">Navigation rapide entre comptes, hashtags, tops et conversations.</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    left_col, right_col = st.columns([1.35, 1], gap="large")
+
+    with left_col:
+        metric_rows = [st.columns(2, gap="medium"), st.columns(2, gap="medium")]
+        metric_data = [
+            ("Profils", kpis.get("user_count", placeholder), "comptes suivis", "aqua", "◉"),
+            ("Hashtags", kpis.get("distinct_hashtag_count", placeholder), "balises distinctes", "mint", "⌗"),
+            ("Tweets", kpis.get("tweet_count", placeholder), "messages indexes", "violet", "✦"),
+            ("Acces", "5", "vues directes disponibles", "indigo", "➜"),
+        ]
+        for row_index, row in enumerate(metric_rows):
+            for col_index, col in enumerate(row):
+                title, value, note, variant, icon = metric_data[(row_index * 2) + col_index]
+                with col:
+                    render_metric_card(title, value, note, variant, icon)
+
+        st.markdown("<div class='milano-hero'>", unsafe_allow_html=True)
+        st.markdown("<div class='milano-panel-title'>Hub de recherche</div>", unsafe_allow_html=True)
+        search_cols = st.columns([1.05, 1.65, 0.8])
+        mode = search_cols[0].selectbox("Mode", ["Utilisateur", "Hashtag", "Texte"], key="home-search-mode")
+        query = search_cols[1].text_input(
+            "Recherche",
+            key="home-search-query",
+            placeholder="username, hashtag ou texte de tweet",
+        )
+        if search_cols[2].button("Explorer", use_container_width=True):
+            on_open_search(mode, query)
+            st.rerun()
+        st.markdown(
+            """
+            <div class="milano-label-row">
+                <span class="milano-chip-soft">Profil exact</span>
+                <span class="milano-chip-soft">Hashtag direct</span>
+                <span class="milano-chip-soft">Texte libre</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with right_col:
+        st.markdown("<div class='milano-panel-title'>Activity</div>", unsafe_allow_html=True)
+        st.caption("Volume des tweets sur les derniers jours disponibles.")
+        if activity:
+            counts = [row.get("tweet_count", 0) for row in activity]
+            st.area_chart({"Tweets": counts}, height=220)
+            labels = " · ".join(row.get("day", "")[5:] for row in activity)
+            st.caption(labels)
+        else:
+            render_placeholder(placeholder)
+
+        st.markdown("<div class='milano-panel-title'>Trending hashtags</div>", unsafe_allow_html=True)
+        st.caption("Raccourcis vers les hashtags les plus actifs.")
+        if top_hashtags:
+            render_bar_rows(
+                top_hashtags,
+                "hashtag",
+                "tweet_count",
+                placeholder,
+                key_prefix="home-tags",
+                on_click=lambda item: on_open_hashtag(item.get("hashtag", "")),
+            )
+        else:
+            render_placeholder(placeholder)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_top10(repo, placeholder, on_open_hashtag, on_open_replies, on_open_profile, on_route_change):
+    render_page_nav(on_route_change, "Top 10")
+    render_page_header("Top 10", "Grand panneau central pour les classements principaux.")
+    top_mode = st.radio("Classement", ["Tweets", "Hashtags"], horizontal=True)
+
+    if top_mode == "Tweets":
+        items = repo.get_top_tweets()
+        render_bar_rows(
+            items,
+            "tweet_id",
+            "favorite_count",
+            placeholder,
+            key_prefix="top-tweets",
+            on_click=lambda item: on_open_replies(item.get("tweet_id", "")),
+        )
+        st.markdown("<div class='milano-divider'></div>", unsafe_allow_html=True)
+        st.markdown("<div class='milano-panel-title'>Extraits</div>", unsafe_allow_html=True)
+        for tweet in items[:5]:
+            render_tweet_card(
+                tweet,
+                placeholder,
+                on_open_profile,
+                on_open_replies,
+                key_prefix=f"top-preview-{tweet.get('tweet_id', 'x')}",
+            )
+    else:
+        items = repo.get_top_hashtags()
+        render_bar_rows(
+            items,
+            "hashtag",
+            "tweet_count",
+            placeholder,
+            key_prefix="top-hashtags",
+            on_click=lambda item: on_open_hashtag(item.get("hashtag", "")),
+        )
+
+
+def render_search(repo, placeholder, on_open_profile, on_open_hashtag, on_open_replies, on_route_change):
+    render_page_nav(on_route_change, "Recherche")
+    render_page_header("Recherche", "Recherche specifique par utilisateur, hashtag ou texte.")
+    mode = st.radio(
+        "Mode de recherche",
+        ["Utilisateur", "Hashtag", "Texte"],
+        horizontal=True,
+        index=["Utilisateur", "Hashtag", "Texte"].index(st.session_state.search_mode),
+    )
+    query = st.text_input("Recherche", value=st.session_state.search_query, placeholder="Tape ta recherche")
+    st.session_state.search_mode = mode
+    st.session_state.search_query = query
+
+    if not query.strip():
+        st.caption("Renseigne une recherche pour afficher des resultats.")
+        return
+
+    if mode == "Utilisateur":
+        rows = repo.search_users(query)
+        if rows == placeholder:
+            render_placeholder(placeholder)
+            return
+        if not rows:
+            st.caption("Aucun utilisateur trouve.")
+            return
+        for user in rows:
+            cols = st.columns([3, 1])
+            cols[0].markdown(
+                f"**@{user.get('username', placeholder)}**  \n{user.get('role', placeholder)} • {user.get('country', placeholder)}"
+            )
+            if cols[1].button("Ouvrir", key=f"search-user-{user.get('user_id', '')}"):
+                on_open_profile(user_id=user.get("user_id", ""), username=user.get("username", ""))
+                st.rerun()
+
+    elif mode == "Hashtag":
+        rows = repo.search_hashtags(query)
+        render_bar_rows(
+            rows,
+            "hashtag",
+            "tweet_count",
+            placeholder,
+            key_prefix="search-hashtag",
+            on_click=lambda item: on_open_hashtag(item.get("hashtag", "")),
+        )
+
+    else:
+        rows = repo.search_tweets_by_text(query)
+        if rows == placeholder:
+            render_placeholder(placeholder)
+            return
+        if not rows:
+            st.caption("Aucun tweet trouve.")
+            return
+        for tweet in rows:
+            render_tweet_card(
+                tweet,
+                placeholder,
+                on_open_profile,
+                on_open_replies,
+                key_prefix=f"search-tweet-{tweet.get('tweet_id', 'x')}",
+            )
+
+
+def render_profile(repo, placeholder, on_open_profile, on_open_replies, on_route_change):
+    render_page_nav(on_route_change, "Profil")
+    render_page_header("Profil utilisateur", "Page detaillee avec tweets recents et bloc media.")
+    selected_user = None
+    if st.session_state.selected_username:
+        selected_user = repo.get_user_by_username(st.session_state.selected_username)
+    if not selected_user and st.session_state.selected_user_id:
+        selected_user = repo.get_user_by_id(st.session_state.selected_user_id)
+
+    if not selected_user:
+        lookup = st.text_input("Charger un profil", placeholder="username exact")
+        if st.button("Afficher le profil", key="profile-lookup"):
+            on_open_profile(username=lookup)
+            st.rerun()
+        st.caption("Selectionne un utilisateur depuis Recherche ou saisis un username exact.")
+        return
+
+    left, right = st.columns([2.3, 1])
+    with left:
+        st.markdown(
+            f"""
+            <div class="milano-card">
+                <div class="milano-eyebrow">Profil</div>
+                <div class="milano-panel-title">@{selected_user.get('username', placeholder)}</div>
+                <div class="milano-meta">{selected_user.get('role', placeholder)} • {selected_user.get('country', placeholder)}</div>
+                <div class="milano-muted">Creation : {selected_user.get('created_at', placeholder)}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown("<div class='milano-panel-title'>Ses tweets</div>", unsafe_allow_html=True)
+        tweets = repo.get_tweets_by_user(selected_user.get("user_id", ""))
+        if tweets == placeholder:
+            render_placeholder(placeholder)
+        elif not tweets:
+            st.caption("Aucun tweet pour ce profil.")
+        else:
+            for tweet in tweets[:12]:
+                render_tweet_card(
+                    tweet,
+                    placeholder,
+                    on_open_profile,
+                    on_open_replies,
+                    key_prefix=f"profile-{tweet.get('tweet_id', 'x')}",
+                )
+    with right:
+        st.markdown("<div class='milano-panel-title'>Media</div>", unsafe_allow_html=True)
+        render_placeholder(placeholder)
+
+
+def render_hashtag(repo, placeholder, on_open_profile, on_open_replies, on_route_change):
+    render_page_nav(on_route_change, "Hashtag")
+    render_page_header("Hashtag", "Liste des posts avec resume d'activite par hashtag.")
+    current_hashtag = st.session_state.selected_hashtag.strip()
+    manual = st.text_input("Hashtag", value=current_hashtag, placeholder="#milano2026")
+    if manual != current_hashtag:
+        st.session_state.selected_hashtag = manual
+
+    if not manual.strip():
+        st.caption("Selectionne un hashtag depuis Recherche ou saisis-en un.")
+        return
+
+    summary = repo.get_hashtag_summary(manual)
+    if not summary:
+        render_placeholder(placeholder)
+        return
+
+    normalized = summary.get("hashtag", manual.strip().lstrip("#"))
+    st.markdown(f"<div class='milano-panel-title'>#{normalized}</div>", unsafe_allow_html=True)
+    metric_cols = st.columns(2)
+    with metric_cols[0]:
+        render_card("Tweets", summary.get("tweet_count", placeholder), "Messages contenant ce hashtag", kind="kpi")
+    with metric_cols[1]:
+        render_card("Utilisateurs", summary.get("user_count", placeholder), "Auteurs distincts", kind="kpi")
+
+    st.markdown("<div class='milano-panel-title'>Tweets associes</div>", unsafe_allow_html=True)
+    tweets = repo.get_tweets_by_hashtag(normalized)
+    if tweets == placeholder:
+        render_placeholder(placeholder)
+    elif not tweets:
+        st.caption("Aucun tweet pour ce hashtag.")
+    else:
+        for tweet in tweets:
+            render_tweet_card(
+                tweet,
+                placeholder,
+                on_open_profile,
+                on_open_replies,
+                key_prefix=f"hashtag-{tweet.get('tweet_id', 'x')}",
+            )
+
+
+def render_replies(repo, placeholder, on_open_profile, on_open_replies, on_route_change):
+    render_page_nav(on_route_change, "Reponses")
+    render_page_header("Reponses", "Vue detail d'un tweet et de ses reponses directes.")
+    tweet_id = st.session_state.selected_tweet_id
+    manual = st.text_input("Tweet ID", value=tweet_id, placeholder="T0001")
+    if manual != tweet_id:
+        st.session_state.selected_tweet_id = manual
+        tweet_id = manual
+
+    if not tweet_id.strip():
+        st.caption("Ouvre un tweet depuis Top 10 ou Recherche.")
+        return
+
+    tweet = repo.get_tweet_by_id(tweet_id)
+    if not tweet:
+        render_placeholder(placeholder)
+        return
+
+    st.markdown("<div class='milano-panel-title'>Tweet selectionne</div>", unsafe_allow_html=True)
+    render_tweet_card(
+        tweet,
+        placeholder,
+        on_open_profile,
+        on_open_replies,
+        key_prefix=f"reply-focus-{tweet.get('tweet_id', 'x')}",
+        show_reply_button=False,
+    )
+
+    parent = repo.get_parent_tweet(tweet)
+    st.markdown("<div class='milano-panel-title'>Tweet parent</div>", unsafe_allow_html=True)
+    if tweet.get("in_reply_to_tweet_id"):
+        if parent:
+            render_tweet_card(
+                parent,
+                placeholder,
+                on_open_profile,
+                on_open_replies,
+                key_prefix=f"reply-parent-{parent.get('tweet_id', 'x')}",
+                show_reply_button=False,
+            )
+        else:
+            render_placeholder(placeholder)
+    else:
+        st.caption("Ce tweet est deja le point de depart.")
+
+    st.markdown("<div class='milano-panel-title'>Reponses directes</div>", unsafe_allow_html=True)
+    replies = repo.get_replies_for_tweet(tweet.get("tweet_id", ""))
+    if replies == placeholder:
+        render_placeholder(placeholder)
+    elif not replies:
+        st.caption("Aucune reponse directe.")
+    else:
+        for reply in replies:
+            render_tweet_card(
+                reply,
+                placeholder,
+                on_open_profile,
+                on_open_replies,
+                key_prefix=f"reply-child-{reply.get('tweet_id', 'x')}",
+                show_reply_button=False,
+            )
+
+    st.markdown("<div class='milano-panel-title'>Conversation etendue</div>", unsafe_allow_html=True)
+    render_placeholder(placeholder)
+
+
+def run_streamlit_ui():
+    if get_script_run_ctx() is None:
+        raise SystemExit(
+            "Cette interface Streamlit doit etre lancee avec :\n"
+            "python src/app_milano/main.py\n"
+            "ou\n"
+            "conda run -n cours streamlit run src/app_milano/utils/display.py"
+        )
+
+    st.set_page_config(page_title="Milano Streamlit", page_icon="M", layout="wide")
+    load_env_file(required=False)
+    init_state()
+    dev_mode = os.getenv("APP_MILANO_UI_MODE") != "desktop"
+    apply_styles(dev_mode=dev_mode)
+    repo = MilanoRepository()
+
+    try:
+        if dev_mode:
+            render_sidebar(repo, ROUTES, st.session_state.route, set_route)
+        route = st.session_state.route
+        if route == "Accueil":
+            render_home(repo, PLACEHOLDER, open_search, open_profile, open_hashtag, open_replies, set_route)
+        elif route == "Top 10":
+            render_top10(repo, PLACEHOLDER, open_hashtag, open_replies, open_profile, set_route)
+        elif route == "Recherche":
+            render_search(repo, PLACEHOLDER, open_profile, open_hashtag, open_replies, set_route)
+        elif route == "Profil":
+            render_profile(repo, PLACEHOLDER, open_profile, open_replies, set_route)
+        elif route == "Hashtag":
+            render_hashtag(repo, PLACEHOLDER, open_profile, open_replies, set_route)
+        else:
+            render_replies(repo, PLACEHOLDER, open_profile, open_replies, set_route)
+    except Exception:
+        st.error("Erreur de chargement de l'interface.")
+        st.markdown("...........")
+    finally:
+        repo.close()
+
+
+if __name__ == "__main__":
+    run_streamlit_ui()

@@ -1,7 +1,4 @@
-from __future__ import annotations
-
 import time
-from typing import Any, Iterable
 
 from neo4j import Driver, GraphDatabase
 
@@ -20,12 +17,12 @@ def wait_for_neo4j(uri: str, user: str, password: str, timeout: int = 120) -> Dr
     raise SystemExit("Neo4j n'est pas pret apres 120 secondes.")
 
 
-def batch_rows(rows: list[dict[str, Any]], size: int = 200) -> Iterable[list[dict[str, Any]]]:
+def batch_rows(rows: list[dict], size: int = 200):
     for start in range(0, len(rows), size):
         yield rows[start : start + size]
 
 
-def import_graph(driver: Driver, users: list[dict[str, Any]], tweets: list[dict[str, Any]]) -> None:
+def import_graph(driver: Driver, users: list[dict], tweets: list[dict]) -> None:
     constraints = [
         "CREATE CONSTRAINT user_user_id IF NOT EXISTS FOR (u:User) REQUIRE u.user_id IS UNIQUE",
         "CREATE CONSTRAINT tweet_tweet_id IF NOT EXISTS FOR (t:Tweet) REQUIRE t.tweet_id IS UNIQUE",
@@ -84,40 +81,40 @@ def import_graph(driver: Driver, users: list[dict[str, Any]], tweets: list[dict[
 
 
 # Question 7: followers de MilanoOps
-def get_milanoops_followers(driver: Driver) -> list[dict[str, Any]]:
+def get_milanoops_followers(driver: Driver) -> list[dict]:
     pass
 
 
 # Question 8: utilisateurs suivis par MilanoOps
-def get_milanoops_following(driver: Driver) -> list[dict[str, Any]]:
+def get_milanoops_following(driver: Driver) -> list[dict]:
     pass
 
 
 # Question 9: relations reciproques avec MilanoOps
-def get_mutual_connections_with_milanoops(driver: Driver) -> list[dict[str, Any]]:
+def get_mutual_connections_with_milanoops(driver: Driver) -> list[dict]:
     pass
 
 
 # Question 10: utilisateurs avec plus de 10 followers
-def get_users_with_more_than_ten_followers(driver: Driver) -> list[dict[str, Any]]:
+def get_users_with_more_than_ten_followers(driver: Driver) -> list[dict]:
     pass
 
 
 # Question 11: utilisateurs qui suivent plus de 5 utilisateurs
-def get_users_following_more_than_five_users(driver: Driver) -> list[dict[str, Any]]:
+def get_users_following_more_than_five_users(driver: Driver) -> list[dict]:
     pass
 
 
 # Question 14: tweets qui initient une discussion
-def get_thread_starters(driver: Driver) -> list[dict[str, Any]]:
+def get_thread_starters(driver: Driver) -> list[dict]:
     pass
 
 
 # Question 15: discussion la plus longue
-def get_longest_discussion(driver: Driver) -> dict[str, Any]:
+def get_longest_discussion(driver: Driver) -> dict:
     pass
 
 
 # Question 16: debut et fin de chaque conversation
-def get_conversation_start_and_end(driver: Driver) -> list[dict[str, Any]]:
+def get_conversation_start_and_end(driver: Driver) -> list[dict]:
     pass
