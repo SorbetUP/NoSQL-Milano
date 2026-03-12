@@ -46,3 +46,35 @@ Bolt: bolt://localhost:7687
 User: neo4j
 Password: neo4j_password
 ```
+
+### SorbetUP / LemmingSnow
+
+- [x] mettre en place une premiere base du projet avec `.env`, `docker-compose.yml` et `bootstrap.py`
+- [x] preparer un dataset de travail dans `data/users.json` et `data/tweets.json`
+- [ ] finaliser `bootstrap.py` pour qu'il serve d'entree principale stable du projet
+- [ ] relier proprement les parties MongoDB et Neo4j dans une execution unique
+- [ ] traiter les questions 1, 2, 3, 12 et 13
+- [ ] verifier les sorties globales de l'application pour l'ensemble des questions
+- [ ] finaliser le `README` avec exemples d'execution et captures
+- [ ] faire les tests finaux et preparer la demo
+- [ ] rediger dans le rapport : introduction, environnement local, architecture generale, integration finale, conclusion
+
+### Kevin Zhang
+
+- [x] creer `mongo/import_data.py` pour l'import MongoDB
+- [x] implementer le CRUD MongoDB dans `mongo/crudfunc.py`
+- [ ] nettoyer et aligner `mongo/import_data.py` et `mongo/crudfunc.py` avec `.env` et le reste du projet
+- [ ] traiter les questions 4, 5 et 6
+- [ ] produire les visualisations MongoDB : KPI, top hashtags, top tweets
+- [ ] rediger dans le rapport : modele MongoDB, CRUD, requetes MongoDB, agregations, visualisations MongoDB
+- [ ] preparer les preuves Scrum cote MongoDB : sprint backlog, daily log, resultats
+
+### Yanis GOBEREAU
+
+- [ ] verifier la connexion Neo4j en local
+- [ ] finaliser l'import Neo4j a partir du dataset MongoDB
+- [ ] completer les relations `FOLLOWS` et `RETWEETS`
+- [ ] traiter les questions 7, 8, 9, 10, 11, 14, 15 et 16
+- [ ] produire la visualisation du reseau autour de `MilanoOps`
+- [ ] rediger dans le rapport : modele Neo4j, relations graphe, requetes Cypher, discussions/threads, visualisation Neo4j
+- [ ] preparer les preuves Scrum cote Neo4j : sprint backlog, daily log, resultats
