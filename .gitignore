@@ -191,6 +191,9 @@ cython_debug/
 # Ruff stuff:
 .ruff_cache/
 
+src/docker/mongo/data/
+src/docker/neo4j/data/
+
 # PyPI configuration file
 .pypirc
 
@@ -202,7 +205,6 @@ cython_debug/
 # Docker local data
 mongo/data/
 neo4j/data/
-neo4j/logs/
 .cursorignore
 .cursorindexingignore
 

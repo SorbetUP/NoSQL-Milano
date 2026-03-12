@@ -1,0 +1,12 @@
+services:
+  mongo:
+    image: mongo:7.0
+    container_name: ${COMPOSE_PROJECT_NAME:-app_milano}_mongo
+    restart: unless-stopped
+    ports:
+      - "${MONGO_PORT}:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+    volumes:
+      - ./src/docker/mongo/data:/data/db
