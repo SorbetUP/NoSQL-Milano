@@ -339,7 +339,7 @@ def _connect_mongo_context(context):
 
     try:
         context["settings"] = load_settings()
-        context["client"] = MongoClient(context["settings"].mongo_app_uri, serverSelectionTimeoutMS=2500)
+        context["client"] = MongoClient(context["settings"].mongo_app_uri, serverSelectionTimeoutMS=800)
         context["client"].admin.command("ping")
         context["db"] = context["client"][context["settings"].mongo_app_db]
         context["source"] = "MongoDB"

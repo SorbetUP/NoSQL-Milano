@@ -21,6 +21,7 @@ import webview
 from streamlit.runtime.scriptrunner_utils.script_run_context import get_script_run_ctx
 
 from app_milano.config import Settings, load_env_file
+from app_milano.utils.cache import CacheStore
 from app_milano.utils.mongo import (
     close_mongo_context,
     create_mongo_context,
@@ -57,7 +58,7 @@ PLACEHOLDER = "in progress"
 ROUTES = ["Accueil", "Top 10", "Recherche", "Profil", "Hashtag", "Reponses", "Reseau"]
 
 
-def print_connection_info(settings: Settings) -> None:
+def print_connection_info(settings):
     print("Execution terminee.")
     print()
     print("MongoDB")
@@ -70,7 +71,7 @@ def print_connection_info(settings: Settings) -> None:
     print(f"Password: {settings.neo4j_password}")
 
 
-def print_question_results(results: dict) -> None:
+def print_question_results(results):
     print()
     print("Questions MongoDB")
     print(f"Q1 - Nombre d'utilisateurs : {results['user_count']}")
@@ -96,42 +97,111 @@ def print_question_results(results: dict) -> None:
 def init_state():
     defaults = {
         "route": "Accueil",
+        "transition_direction": "none",
         "selected_user_id": "",
         "selected_username": "",
         "selected_hashtag": "",
         "selected_tweet_id": "",
         "search_mode": "Utilisateur",
         "search_query": "",
+        "ui_cache_store": None,
+        "ui_mongo_context": None,
+        "ui_neo4j_context": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
 
 
+def get_ui_cache():
+    cache = st.session_state.get("ui_cache_store")
+    if cache is None:
+        cache = CacheStore(ttl_seconds=45, max_items=512)
+        st.session_state.ui_cache_store = cache
+    return cache
+
+
+def clear_ui_cache():
+    get_ui_cache().clear()
+
+
+def get_mongo_context():
+    context = st.session_state.get("ui_mongo_context")
+    if context is None:
+        context = create_mongo_context(PLACEHOLDER)
+        st.session_state.ui_mongo_context = context
+    return context
+
+
+def get_neo4j_context():
+    context = st.session_state.get("ui_neo4j_context")
+    if context is None:
+        context = create_neo4j_context(PLACEHOLDER)
+        st.session_state.ui_neo4j_context = context
+    return context
+
+
+def reset_ui_backends():
+    mongo_context = st.session_state.get("ui_mongo_context")
+    neo4j_context = st.session_state.get("ui_neo4j_context")
+    if mongo_context is not None:
+        close_mongo_context(mongo_context)
+    if neo4j_context is not None:
+        close_neo4j_context(neo4j_context)
+    st.session_state.ui_mongo_context = None
+    st.session_state.ui_neo4j_context = None
+    clear_ui_cache()
+
+
+def get_cached_mongo(repo, cache_name, producer, *key_parts):
+    key = ("mongo", get_mongo_source(repo), cache_name) + tuple(key_parts)
+    return get_ui_cache().get_or_set(key, producer)
+
+
+def get_cached_neo4j(cache_name, producer, *key_parts):
+    key = ("neo4j", cache_name) + tuple(key_parts)
+    return get_ui_cache().get_or_set(key, producer)
+
+
 def set_route(route):
+    current_route = st.session_state.route
+    if route not in ROUTES:
+        st.session_state.route = route
+        st.session_state.transition_direction = "none"
+        return
+    current_index = ROUTES.index(current_route)
+    next_index = ROUTES.index(route)
+    st.session_state.transition_direction = "forward" if next_index >= current_index else "backward"
     st.session_state.route = route
+
+
+def move_route(delta):
+    current_index = ROUTES.index(st.session_state.route)
+    next_index = max(0, min(len(ROUTES) - 1, current_index + delta))
+    st.session_state.transition_direction = "forward" if next_index >= current_index else "backward"
+    st.session_state.route = ROUTES[next_index]
 
 
 def open_profile(user_id="", username=""):
     st.session_state.selected_user_id = user_id or ""
     st.session_state.selected_username = username or ""
-    st.session_state.route = "Profil"
+    set_route("Profil")
 
 
 def open_hashtag(hashtag):
     st.session_state.selected_hashtag = hashtag or ""
-    st.session_state.route = "Hashtag"
+    set_route("Hashtag")
 
 
 def open_replies(tweet_id):
     st.session_state.selected_tweet_id = tweet_id or ""
-    st.session_state.route = "Reponses"
+    set_route("Reponses")
 
 
 def open_search(mode, query):
     st.session_state.search_mode = mode
     st.session_state.search_query = query or ""
-    st.session_state.route = "Recherche"
+    set_route("Recherche")
 
 
 def find_free_port():
@@ -147,7 +217,7 @@ def wait_for_server(url, timeout=30):
             with urllib.request.urlopen(url, timeout=2):
                 return
         except Exception:
-            time.sleep(0.5)
+            time.sleep(0.4)
     raise SystemExit("L'interface Streamlit n'a pas demarre a temps.")
 
 
@@ -192,24 +262,24 @@ def launch_desktop():
     wait_for_server(url)
 
     webview.create_window(
-        "Milano Interface",
+        "Milano Review",
         url,
-        width=1480,
-        height=920,
-        min_size=(1080, 720),
+        width=1500,
+        height=940,
+        min_size=(1120, 760),
         text_select=True,
-        background_color="#eef3f7",
+        background_color="#050505",
     )
     webview.start()
 
 
-def apply_styles(dev_mode=True):
+def apply_styles(dev_mode=True, transition_direction="none"):
     sidebar_rules = """
         [data-testid="stSidebar"] {
-            background: linear-gradient(180deg, #19324a 0%, #284e68 100%);
+            background: #0d0d0d;
         }
         [data-testid="stSidebar"] * {
-            color: #f7f2e8 !important;
+            color: #f5ead9 !important;
         }
     """
     if not dev_mode:
@@ -224,417 +294,550 @@ def apply_styles(dev_mode=True):
         header { display: none; }
         """
 
+    animation_rule = "none"
+    if transition_direction == "forward":
+        animation_rule = "wrappedSlideForward 280ms cubic-bezier(0.22, 1, 0.36, 1)"
+    elif transition_direction == "backward":
+        animation_rule = "wrappedSlideBackward 280ms cubic-bezier(0.22, 1, 0.36, 1)"
+
     styles = """
         <style>
+        html, body, [data-testid="stAppViewContainer"], [data-testid="stMain"], .main {
+            margin-top: 0 !important;
+            padding-top: 0 !important;
+        }
         .block-container {
-            max-width: 1380px;
-            padding-top: 0.6rem;
+            max-width: 980px;
+            padding-top: 0 !important;
             padding-bottom: 2rem;
+            background: linear-gradient(180deg, rgba(16,16,16,0.98) 0%, rgba(6,6,6,0.98) 100%);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 34px;
+            padding-left: 1.15rem !important;
+            padding-right: 1.15rem !important;
+            padding-bottom: 1rem !important;
+            box-shadow: 0 30px 80px rgba(0, 0, 0, 0.45);
+            min-height: 760px;
+            margin-top: 0 !important;
+            animation: __ANIMATION_RULE__;
         }
         .stApp {
-            background: #eef2f6;
-            color: #22324b;
+            background:
+                radial-gradient(circle at top, rgba(255, 39, 20, 0.16), transparent 24%),
+                radial-gradient(circle at bottom right, rgba(128, 0, 255, 0.10), transparent 28%),
+                linear-gradient(180deg, #0b0b0b 0%, #040404 100%);
+            color: #f6ecde;
             font-family: "Trebuchet MS", "Segoe UI", sans-serif;
         }
         __SIDEBAR_RULES__
+        section.main > div {
+            padding-top: 0 !important;
+        }
         .stButton > button {
             border-radius: 999px;
-            border: 0;
-            background: #6a98f5;
+            border: 1px solid rgba(255,255,255,0.10);
+            background: #e62117;
             color: white;
-            font-weight: 700;
-            min-height: 2.6rem;
-            box-shadow: 0 10px 24px rgba(92, 140, 255, 0.22);
+            font-weight: 800;
+            min-height: 2.65rem;
+            box-shadow: none;
         }
         .stButton > button:hover {
+            border: 1px solid rgba(255,255,255,0.14);
+            background: #cb1c15;
             color: white;
-            border: 0;
-            background: #5a87e1;
+        }
+        .stButton > button[kind="secondary"] {
+            background: #171717;
         }
         .stTextInput input, .stSelectbox div[data-baseweb="select"] > div, .stTextInput textarea {
             border-radius: 16px !important;
-            border: 1px solid rgba(34,50,75,0.08) !important;
-            background: rgba(255,255,255,0.92) !important;
+            border: 1px solid rgba(255,255,255,0.10) !important;
+            background: rgba(18,18,18,0.96) !important;
+            color: #f6ecde !important;
         }
-        div[data-baseweb="select"] {
-            border-radius: 16px;
+        [data-testid="stMarkdownContainer"] *,
+        [data-testid="stCaptionContainer"] *,
+        .stRadio *,
+        .stSelectbox *,
+        .stTextInput *,
+        .st-emotion-cache-1tacg1d *,
+        .st-emotion-cache-1sdfa05 * {
+            color: #f6ecde !important;
         }
-        .stRadio [role="radiogroup"] {
-            gap: 0.75rem;
+        .stRadio label, .stSelectbox label, .stTextInput label {
+            color: #bfae99 !important;
+            font-weight: 700 !important;
         }
-        .milano-title {
-            font-size: 2.3rem;
-            font-weight: 800;
-            letter-spacing: 0.04em;
-            color: #263955;
-            margin-bottom: 0.15rem;
+        .stMarkdown, .stCaption, p, li, label {
+            color: #e8dccb;
         }
-        .milano-subtitle {
-            color: #6f7f95;
-            margin-bottom: 1rem;
+        [data-testid="stVegaLiteChart"] > div,
+        [data-testid="stVegaLiteChart"] svg,
+        [data-testid="stVegaLiteChart"] canvas {
+            background: transparent !important;
         }
-        .milano-card {
-            background: rgba(255,255,255,0.95);
-            border: 1px solid rgba(34,50,75,0.07);
-            border-radius: 24px;
-            padding: 1rem 1rem 0.9rem 1rem;
-            box-shadow: 0 18px 36px rgba(28, 39, 60, 0.08);
-            min-height: 140px;
-            margin-bottom: 0.9rem;
+        [data-testid="stElementToolbar"] {
+            background: transparent !important;
         }
-        .milano-shell {
-            background: rgba(255,255,255,0.72);
-            border: 1px solid rgba(34,50,75,0.06);
-            border-radius: 30px;
-            box-shadow: 0 20px 50px rgba(32, 42, 68, 0.10);
-            padding: 1.25rem;
-            backdrop-filter: blur(10px);
-        }
-        .milano-topbar {
-            background: rgba(255,255,255,0.92);
-            border: 1px solid rgba(34,50,75,0.06);
-            border-radius: 24px;
-            padding: 0.9rem 1rem 1rem 1rem;
-            margin-bottom: 0.8rem;
-        }
-        .milano-badge {
-            display: inline-block;
-            padding: 0.35rem 0.75rem;
-            border-radius: 999px;
-            background: rgba(82, 197, 190, 0.12);
-            color: #2f7d78;
-            font-size: 0.82rem;
-            font-weight: 700;
-            margin-left: 0.4rem;
-        }
-        .milano-metric {
-            border-radius: 26px;
-            padding: 1rem;
-            color: white;
-            box-shadow: 0 20px 38px rgba(52, 88, 163, 0.18);
-            min-height: 148px;
-            margin-bottom: 0.9rem;
-        }
-        .milano-metric.aqua {
-            background: #6cb9f2;
-        }
-        .milano-metric.mint {
-            background: #5fd6bf;
-        }
-        .milano-metric.violet {
-            background: #8b73ef;
-        }
-        .milano-metric.indigo {
-            background: #6e95f5;
-        }
-        .milano-metric .metric-icon {
-            width: 42px;
-            height: 42px;
-            border-radius: 14px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            background: rgba(255,255,255,0.2);
-            font-size: 1.2rem;
-            margin-bottom: 1.2rem;
-        }
-        .milano-metric .metric-title {
-            font-size: 0.9rem;
-            opacity: 0.9;
-            margin-bottom: 0.3rem;
-        }
-        .milano-metric .metric-value {
-            font-size: 2rem;
-            font-weight: 800;
-            margin-bottom: 0.25rem;
-        }
-        .milano-metric .metric-note {
-            font-size: 0.85rem;
-            opacity: 0.92;
-        }
-        .milano-panel {
-            background: rgba(255,255,255,0.92);
-            border: 1px solid rgba(34,50,75,0.06);
-            border-radius: 24px;
-            padding: 1rem 1rem 0.8rem 1rem;
-            box-shadow: 0 16px 34px rgba(27, 42, 69, 0.08);
-            margin-bottom: 0.95rem;
-        }
-        .milano-mini-card {
-            background: rgba(246, 249, 252, 0.95);
-            border: 1px solid rgba(34,50,75,0.06);
-            border-radius: 18px;
-            padding: 0.9rem;
-            min-height: 128px;
-            margin-bottom: 0.85rem;
-        }
-        .milano-nav-wrap {
-            margin-bottom: 0.8rem;
-        }
-        .milano-eyebrow {
-            text-transform: uppercase;
-            letter-spacing: 0.12em;
-            font-size: 0.72rem;
-            color: #7a8aa2;
-            margin-bottom: 0.35rem;
-        }
-        .milano-number {
-            font-size: 2rem;
-            font-weight: 800;
-            color: #263955;
-        }
-        .milano-panel-title {
-            font-size: 1.3rem;
-            font-weight: 800;
-            color: #24344e;
-            margin: 0.2rem 0 0.75rem 0;
-        }
-        .milano-muted {
-            color: #7b8a9e;
-        }
-        .milano-placeholder {
-            border: 2px dashed #b55d46;
-            background: rgba(181,93,70,0.08);
-            color: #8a3f2c;
-            border-radius: 14px;
-            padding: 0.85rem 1rem;
-            text-align: center;
-            font-weight: 700;
-            letter-spacing: 0.08em;
-        }
-        .milano-tweet {
-            background: rgba(255,255,255,0.9);
-            border-left: 5px solid #52c5be;
-            border-radius: 18px;
-            padding: 0.9rem 1rem;
-            margin-bottom: 0.7rem;
-            box-shadow: 0 12px 22px rgba(25,50,74,0.05);
-        }
-        .milano-meta {
-            font-size: 0.85rem;
-            color: #536173;
-            margin-bottom: 0.4rem;
-        }
-        .milano-chip {
-            display: inline-block;
-            padding: 0.2rem 0.55rem;
-            margin-right: 0.35rem;
-            margin-bottom: 0.35rem;
-            border-radius: 999px;
-            background: rgba(29,53,87,0.08);
-            border: 1px solid rgba(29,53,87,0.18);
-            color: #1d3557;
-            font-size: 0.82rem;
-            font-weight: 700;
-        }
-        .milano-bar-row {
-            margin-bottom: 0.65rem;
-        }
-        .milano-bar-track {
-            width: 100%;
-            height: 12px;
-            background: rgba(29,53,87,0.10);
-            border-radius: 999px;
-            overflow: hidden;
-        }
-        .milano-bar-fill {
-            height: 12px;
-            border-radius: 999px;
-            background: linear-gradient(90deg, #1d3557 0%, #3e7c74 100%);
-        }
-        .milano-hero {
-            background: rgba(255,255,255,0.96);
-            border: 1px solid rgba(34,50,75,0.07);
-            border-radius: 24px;
-            padding: 1.1rem;
-            margin-bottom: 1rem;
-            box-shadow: 0 16px 34px rgba(27, 42, 69, 0.08);
-        }
-        .milano-divider {
-            height: 1px;
-            background: rgba(25,50,74,0.12);
-            margin: 0.8rem 0;
-        }
-        .milano-user-row {
+        .wrapped-head {
             display: flex;
             align-items: center;
             justify-content: space-between;
-            gap: 0.75rem;
-            padding: 0.8rem 0.1rem;
-            border-bottom: 1px solid rgba(34,50,75,0.06);
+            gap: 1rem;
+            margin-bottom: 0.8rem;
         }
-        .milano-user-row:last-child {
-            border-bottom: 0;
+        .wrapped-brand {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.55rem;
+            font-size: 0.94rem;
+            font-weight: 800;
+            color: #fff4e6;
         }
-        .milano-avatar {
-            width: 42px;
-            height: 42px;
-            border-radius: 50%;
-            background: #7fa2f2;
-            color: white;
-            display: flex;
+        .wrapped-logo {
+            display: inline-flex;
             align-items: center;
             justify-content: center;
-            font-weight: 800;
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #00c2ff 0%, #56e39f 48%, #ffffff 100%);
+            color: #091018;
+            font-size: 0.95rem;
+            font-weight: 900;
+            box-shadow: 0 0 0 2px rgba(255,255,255,0.08);
         }
-        .milano-chip-soft {
-            display: inline-block;
-            padding: 0.3rem 0.7rem;
+        .wrapped-brand-text {
+            display: flex;
+            flex-direction: column;
+            line-height: 1.02;
+        }
+        .wrapped-brand-title {
+            color: #fff4e6;
+            font-size: 0.92rem;
+            font-weight: 900;
+            letter-spacing: 0.02em;
+        }
+        .wrapped-brand-subtitle {
+            color: #bfae99;
+            font-size: 0.70rem;
+            text-transform: uppercase;
+            letter-spacing: 0.14em;
+        }
+        .wrapped-close {
+            color: #c8b6a3;
+            font-size: 1.2rem;
+            font-weight: 700;
+        }
+        .wrapped-progress {
+            display: grid;
+            grid-template-columns: repeat(7, 1fr);
+            gap: 0.35rem;
+            margin-bottom: 1.25rem;
+        }
+        .wrapped-progress-item {
+            height: 4px;
             border-radius: 999px;
-            background: rgba(92, 140, 255, 0.08);
-            color: #4c63c7;
-            font-size: 0.8rem;
+            background: rgba(255,255,255,0.10);
+        }
+        .wrapped-progress-item.active {
+            background: linear-gradient(90deg, #ff3d24 0%, #ff7462 100%);
+        }
+        .wrapped-title {
+            font-size: 3.35rem;
+            line-height: 0.94;
+            font-weight: 900;
+            text-transform: uppercase;
+            letter-spacing: -0.04em;
+            color: #fff4e6;
+            margin: 0 0 0.5rem 0;
+        }
+        .wrapped-subtitle {
+            color: #bfae99;
+            font-size: 1.05rem;
+            margin-bottom: 1rem;
+            max-width: 34rem;
+        }
+        .wrapped-route-label {
+            text-transform: uppercase;
+            letter-spacing: 0.18em;
+            font-size: 0.72rem;
+            color: #9a8a78;
+            margin-bottom: 0.6rem;
+        }
+        .wrapped-panel {
+            background: rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 24px;
+            padding: 1rem;
+            margin-bottom: 0.9rem;
+        }
+        .wrapped-stat {
+            background: rgba(255,255,255,0.04);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 24px;
+            padding: 1rem;
+            min-height: 132px;
+        }
+        .wrapped-stat-label {
+            color: #bfae99;
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            font-size: 0.72rem;
+            margin-bottom: 0.45rem;
+        }
+        .wrapped-stat-value {
+            font-size: 2rem;
+            font-weight: 900;
+            color: #fff4e6;
+            margin-bottom: 0.3rem;
+        }
+        .wrapped-stat-note {
+            color: #bfae99;
+            font-size: 0.9rem;
+        }
+        .wrapped-number-row {
+            display: grid;
+            grid-template-columns: 38px 1fr 90px;
+            gap: 0.8rem;
+            align-items: center;
+            padding: 0.8rem 0;
+            border-bottom: 1px solid rgba(255,255,255,0.08);
+        }
+        .wrapped-number-row:last-child {
+            border-bottom: 0;
+        }
+        .wrapped-rank {
+            font-size: 1.55rem;
+            font-weight: 900;
+            color: #fff4e6;
+            text-align: center;
+        }
+        .wrapped-item-label {
+            color: #fff4e6;
+            font-weight: 700;
+            margin-bottom: 0.3rem;
+        }
+        .wrapped-item-meta {
+            color: #bfae99;
+            font-size: 0.9rem;
+        }
+        .wrapped-bar-track {
+            width: 100%;
+            height: 3px;
+            background: rgba(255,255,255,0.14);
+            border-radius: 999px;
+            position: relative;
+            margin-top: 0.55rem;
+        }
+        .wrapped-bar-fill {
+            height: 3px;
+            border-radius: 999px;
+            background: linear-gradient(90deg, #ff321e 0%, #ff7a5c 100%);
+        }
+        .wrapped-value-tag {
+            font-weight: 800;
+            color: #ffd5ce;
+            text-align: right;
+        }
+        .wrapped-tweet {
+            background: rgba(255,255,255,0.04);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 24px;
+            padding: 1rem 1rem 0.8rem 1rem;
+            margin-bottom: 0.8rem;
+        }
+        .wrapped-tweet-meta {
+            font-size: 0.84rem;
+            color: #bfae99;
+            margin-bottom: 0.55rem;
+        }
+        .wrapped-tweet-text {
+            color: #fff4e6;
+            font-size: 1.05rem;
+            line-height: 1.45;
+            margin-bottom: 0.65rem;
+        }
+        .wrapped-chip {
+            display: inline-block;
+            padding: 0.25rem 0.6rem;
+            border-radius: 999px;
+            background: rgba(255, 77, 58, 0.12);
+            border: 1px solid rgba(255, 77, 58, 0.22);
+            color: #ffb6ab;
+            font-size: 0.82rem;
             font-weight: 700;
             margin-right: 0.35rem;
             margin-bottom: 0.35rem;
         }
-        .milano-label-row {
+        .wrapped-placeholder {
+            border: 1px dashed rgba(255,255,255,0.18);
+            border-radius: 20px;
+            background: rgba(255,255,255,0.03);
+            color: #bfae99;
+            text-align: center;
+            padding: 2rem 1rem;
+            font-weight: 800;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+        }
+        .wrapped-hero-center-block {
+            min-height: 430px;
             display: flex;
-            gap: 0.45rem;
-            flex-wrap: wrap;
-            margin-top: 0.6rem;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+        }
+        .wrapped-hero-center-block .wrapped-title {
+            max-width: 13rem;
+            margin: 0 auto 1rem auto;
+        }
+        .wrapped-section-title {
+            font-size: 1.1rem;
+            font-weight: 900;
+            color: #fff4e6;
+            margin: 0.1rem 0 0.85rem 0;
+        }
+        .wrapped-foot {
+            margin-top: 1rem;
+            padding-top: 1rem;
+            border-top: 1px solid rgba(255,255,255,0.08);
+        }
+        .wrapped-foot-note {
+            color: #8f8173;
+            text-align: center;
+            font-size: 0.8rem;
+            margin-top: 0.55rem;
+        }
+        .wrapped-pill {
+            display: inline-block;
+            padding: 0.35rem 0.75rem;
+            border-radius: 999px;
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.10);
+            color: #f6ecde;
+            font-size: 0.82rem;
+            margin-right: 0.35rem;
+            margin-bottom: 0.35rem;
+        }
+        .wrapped-divider {
+            height: 1px;
+            background: rgba(255,255,255,0.08);
+            margin: 0.85rem 0;
+        }
+        .wrapped-grid-2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0.9rem;
+        }
+        .wrapped-grid-3 {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 0.9rem;
+        }
+        .wrapped-grid-4 {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 0.9rem;
+        }
+        .st-key-edge-left-nav,
+        .st-key-edge-right-nav {
+            position: fixed;
+            top: 0;
+            bottom: 0;
+            width: max(84px, calc((100vw - 980px) / 2));
+            z-index: 25;
+        }
+        .st-key-edge-left-nav {
+            left: 0;
+        }
+        .st-key-edge-right-nav {
+            right: 0;
+        }
+        .st-key-edge-left-nav .stButton,
+        .st-key-edge-right-nav .stButton {
+            height: 100%;
+        }
+        .st-key-edge-left-nav button,
+        .st-key-edge-right-nav button {
+            width: 100%;
+            min-height: 100vh !important;
+            height: 100vh !important;
+            border: 0 !important;
+            border-radius: 0 !important;
+            background: transparent !important;
+            color: transparent !important;
+            box-shadow: none !important;
+        }
+        .st-key-edge-left-nav button:hover {
+            background: rgba(255,255,255,0.02) !important;
+        }
+        .st-key-edge-right-nav button:hover {
+            background: rgba(255,255,255,0.02) !important;
+        }
+        .st-key-edge-left-nav button:disabled,
+        .st-key-edge-right-nav button:disabled {
+            background: transparent !important;
+            opacity: 0.35;
+        }
+        @keyframes wrappedSlideForward {
+            from {
+                opacity: 0.40;
+                transform: translateX(32px) scale(0.985);
+            }
+            to {
+                opacity: 1;
+                transform: translateX(0) scale(1);
+            }
+        }
+        @keyframes wrappedSlideBackward {
+            from {
+                opacity: 0.40;
+                transform: translateX(-32px) scale(0.985);
+            }
+            to {
+                opacity: 1;
+                transform: translateX(0) scale(1);
+            }
+        }
+        @media (max-width: 980px) {
+            .wrapped-grid-2,
+            .wrapped-grid-3,
+            .wrapped-grid-4 {
+                grid-template-columns: 1fr;
+            }
+            .wrapped-title {
+                font-size: 2.45rem;
+            }
+            .block-container {
+                min-height: auto;
+            }
+            .st-key-edge-left-nav,
+            .st-key-edge-right-nav {
+                width: 52px;
+            }
         }
         </style>
-    """.replace("__SIDEBAR_RULES__", sidebar_rules)
+    """.replace("__SIDEBAR_RULES__", sidebar_rules).replace("__ANIMATION_RULE__", animation_rule)
     st.markdown(styles, unsafe_allow_html=True)
 
 
-def render_sidebar(repo, routes, current_route, on_route_change):
+def render_dev_sidebar(repo):
     st.sidebar.markdown("## Milano")
-    st.sidebar.caption("Interface Streamlit inspiree du croquis.")
-    selected = st.sidebar.radio("Navigation", routes, index=routes.index(current_route))
-    if selected != current_route:
-        on_route_change(selected)
+    st.sidebar.caption("Mode dev de l'interface review")
+    selected = st.sidebar.radio("Slide", ROUTES, index=ROUTES.index(st.session_state.route))
+    if selected != st.session_state.route:
+        st.session_state.route = selected
+        st.rerun()
     st.sidebar.markdown("---")
     st.sidebar.caption(f"Source active : {get_mongo_source(repo)}")
-    st.sidebar.caption("Si une donnee ou une question n'est pas encore finalisee, l'interface affiche `in progress`.")
+    if st.sidebar.button("Refresh data", use_container_width=True):
+        reset_ui_backends()
+        st.rerun()
+    st.sidebar.caption("Les zones non branchees affichent `in progress`.")
 
 
-def render_page_nav(on_route_change, current_route):
-    st.markdown("<div class='milano-nav-wrap'>", unsafe_allow_html=True)
-    nav_cols = st.columns([0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 1.4])
-    labels = ["Accueil", "Top 10", "Recherche", "Profil", "Hashtag", "Reponses", "Reseau"]
-    for index, label in enumerate(labels):
-        button_label = label
-        if label == current_route:
-            button_label = f"• {label}"
-        if nav_cols[index].button(button_label, key=f"page-nav-{current_route}-{label}", use_container_width=True):
-            on_route_change(label)
-            st.rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
+def render_edge_navigation():
+    current_index = ROUTES.index(st.session_state.route)
+    if st.button(" ", key="edge-left-nav", disabled=current_index == 0):
+        move_route(-1)
+        st.rerun()
+    if st.button(" ", key="edge-right-nav", disabled=current_index == len(ROUTES) - 1):
+        move_route(1)
+        st.rerun()
 
 
-def render_metric_card(title, value, note, variant, icon):
+def render_progress(current_route):
+    current_index = ROUTES.index(current_route)
+    segments = []
+    for index, _ in enumerate(ROUTES):
+        css = "wrapped-progress-item"
+        if index <= current_index:
+            css += " active"
+        segments.append(f"<div class='{css}'></div>")
+    st.markdown(f"<div class='wrapped-progress'>{''.join(segments)}</div>", unsafe_allow_html=True)
+
+
+def render_slide_header(current_route, title, subtitle):
+    slide_index = ROUTES.index(current_route) + 1
     st.markdown(
         f"""
-        <div class="milano-metric {variant}">
-            <div class="metric-icon">{icon}</div>
-            <div class="metric-title">{title}</div>
-            <div class="metric-value">{value}</div>
-            <div class="metric-note">{note}</div>
+        <div class="wrapped-head">
+            <div class="wrapped-brand">
+                <span class="wrapped-logo">26</span>
+                <span class="wrapped-brand-text">
+                    <span class="wrapped-brand-title">Milano Cortina</span>
+                    <span class="wrapped-brand-subtitle">Winter Games Review</span>
+                </span>
+            </div>
+            <div class="wrapped-close">{slide_index:02d}/{len(ROUTES):02d}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
+    render_progress(current_route)
+    st.markdown(f"<div class='wrapped-route-label'>{current_route}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='wrapped-title'>{title}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='wrapped-subtitle'>{subtitle}</div>", unsafe_allow_html=True)
+
+
+def render_slide_footer(current_route):
+    return None
+
+
 def render_placeholder(placeholder):
-    st.markdown(f"<div class='milano-placeholder'>{placeholder}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='wrapped-placeholder'>{placeholder}</div>", unsafe_allow_html=True)
 
 
-def render_page_header(title, subtitle):
-    st.markdown(f"<div class='milano-title'>{title}</div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='milano-subtitle'>{subtitle}</div>", unsafe_allow_html=True)
-
-
-def render_card(title, value, note="", kind=""):
-    classes = "milano-card"
-    if kind:
-        classes += f" {kind}"
+def render_stat(label, value, note):
     st.markdown(
         f"""
-        <div class="{classes}">
-            <div class="milano-eyebrow">{title}</div>
-            <div class="milano-number">{value}</div>
-            <div class="milano-muted">{note}</div>
+        <div class="wrapped-stat">
+            <div class="wrapped-stat-label">{label}</div>
+            <div class="wrapped-stat-value">{value}</div>
+            <div class="wrapped-stat-note">{note}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
 
-def render_question_block(question_label, title, result, placeholder):
-    st.markdown(f"<div class='milano-panel-title'>{question_label} - {title}</div>", unsafe_allow_html=True)
-
-    if result == placeholder:
-        render_placeholder(placeholder)
-        return
-
-    if isinstance(result, dict):
-        for key, value in result.items():
-            if isinstance(value, list):
-                st.markdown(f"**{key}**")
-                if not value:
-                    render_placeholder(placeholder)
-                else:
-                    for item in value[:10]:
-                        st.markdown(f"- `{item}`")
-            else:
-                st.markdown(f"**{key}** : {value}")
-        return
-
-    if isinstance(result, list):
-        if not result:
-            render_placeholder(placeholder)
-            return
-        for item in result[:10]:
-            if isinstance(item, dict):
-                fragments = []
-                for key, value in item.items():
-                    fragments.append(f"{key}: {value}")
-                st.markdown(f"- {' | '.join(fragments)}")
-            else:
-                st.markdown(f"- {item}")
-        return
-
-    st.markdown(str(result))
-
-
-def render_bar_rows(items, label_key, value_key, placeholder, on_click=None, key_prefix="bar"):
+def render_rank_rows(items, label_key, value_key, placeholder, on_open=None, key_prefix="rank"):
     if items == placeholder:
         render_placeholder(placeholder)
         return
-
     if not items:
-        st.caption("Aucun resultat.")
+        render_placeholder(placeholder)
         return
 
     max_value = max(item.get(value_key, 0) for item in items) or 1
-    for index, item in enumerate(items, start=1):
+    for index, item in enumerate(items[:5], start=1):
         label = item.get(label_key, placeholder)
         value = item.get(value_key, placeholder)
-        width = 0
         if isinstance(value, int):
-            width = max(8, int((value / max_value) * 100))
-
-        cols = st.columns([0.45, 2.6, 0.8, 0.9])
-        cols[0].markdown(f"**{index}.**")
-        cols[1].markdown(label)
-        if isinstance(value, int):
-            cols[2].markdown(
-                f"""
-                <div class="milano-bar-row">
-                    <div class="milano-bar-track">
-                        <div class="milano-bar-fill" style="width:{width}%"></div>
-                    </div>
+            width = int((value / max_value) * 100) if max_value else 0
+            bar = f"""
+                <div class="wrapped-bar-track">
+                    <div class="wrapped-bar-fill" style="width:{max(8, width)}%"></div>
                 </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            cols[2].caption(str(value))
+            """
         else:
-            cols[2].markdown(value)
-        if on_click:
-            if cols[3].button("Ouvrir", key=f"{key_prefix}-{index}-{label}"):
-                on_click(item)
+            bar = ""
+
+        cols = st.columns([0.22, 1.85, 0.5, 0.5])
+        cols[0].markdown(f"<div class='wrapped-rank'>{index}</div>", unsafe_allow_html=True)
+        cols[1].markdown(
+            f"""
+            <div class="wrapped-item-label">{label}</div>
+            <div class="wrapped-item-meta">{bar}</div>
+            """,
+            unsafe_allow_html=True,
+        )
+        cols[2].markdown(f"<div class='wrapped-value-tag'>{value}</div>", unsafe_allow_html=True)
+        if on_open:
+            if cols[3].button("Voir", key=f"{key_prefix}-{index}-{label}"):
+                on_open(item)
                 st.rerun()
 
 
@@ -644,478 +847,441 @@ def render_tweet_card(tweet, placeholder, on_open_profile, on_open_replies, key_
         return
 
     hashtags = tweet.get("hashtags", [])
-    chips = "".join(f"<span class='milano-chip'>#{tag}</span>" for tag in hashtags[:5])
+    chips = "".join(f"<span class='wrapped-chip'>#{tag}</span>" for tag in hashtags[:4])
     st.markdown(
         f"""
-        <div class="milano-tweet">
-            <div class="milano-meta">@{tweet.get('username', 'unknown')} • {tweet.get('created_at', placeholder)} • {tweet.get('favorite_count', placeholder)} likes</div>
-            <div>{tweet.get('text', placeholder)}</div>
-            <div style="margin-top:0.55rem;">{chips}</div>
+        <div class="wrapped-tweet">
+            <div class="wrapped-tweet-meta">@{tweet.get('username', 'unknown')} • {tweet.get('created_at', placeholder)} • {tweet.get('favorite_count', placeholder)} likes</div>
+            <div class="wrapped-tweet-text">{tweet.get('text', placeholder)}</div>
+            <div>{chips}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
-    action_cols = st.columns([1, 1, 3])
-    if action_cols[0].button("Profil", key=f"{key_prefix}-profile-{tweet.get('tweet_id', 'x')}"):
+    buttons = st.columns([1, 1, 2])
+    if buttons[0].button("Profil", key=f"{key_prefix}-profile-{tweet.get('tweet_id', 'x')}"):
         on_open_profile(user_id=tweet.get("user_id", ""), username=tweet.get("username", ""))
         st.rerun()
-    if show_reply_button and action_cols[1].button("Reponses", key=f"{key_prefix}-reply-{tweet.get('tweet_id', 'x')}"):
+    if show_reply_button and buttons[1].button("Slide", key=f"{key_prefix}-reply-{tweet.get('tweet_id', 'x')}"):
         on_open_replies(tweet.get("tweet_id", ""))
         st.rerun()
 
 
-def render_home(repo, placeholder, on_open_search, on_open_profile, on_open_hashtag, on_open_replies, on_route_change):
-    kpis = get_ui_kpis(repo)
-    activity = get_ui_activity_series(repo)
-    top_hashtags = get_ui_top_hashtags(repo)[:4]
+def render_question_block(question_label, title, result, placeholder):
+    st.markdown(f"<div class='wrapped-section-title'>{question_label} · {title}</div>", unsafe_allow_html=True)
+    if result == placeholder:
+        render_placeholder(placeholder)
+        return
+    if isinstance(result, list):
+        if not result:
+            render_placeholder(placeholder)
+            return
+        for item in result[:8]:
+            if isinstance(item, dict):
+                fragments = []
+                for key, value in item.items():
+                    fragments.append(f"{key}: {value}")
+                st.markdown(f"<div class='wrapped-panel'>{' | '.join(fragments)}</div>", unsafe_allow_html=True)
+            else:
+                st.markdown(f"<div class='wrapped-panel'>{item}</div>", unsafe_allow_html=True)
+        return
+    if isinstance(result, dict):
+        if not result:
+            render_placeholder(placeholder)
+            return
+        for key, value in result.items():
+            st.markdown(f"<div class='wrapped-panel'><strong>{key}</strong> : {value}</div>", unsafe_allow_html=True)
+        return
+    st.markdown(f"<div class='wrapped-panel'>{result}</div>", unsafe_allow_html=True)
 
-    st.markdown("<div class='milano-shell'>", unsafe_allow_html=True)
+
+def render_dark_activity_chart(activity_rows):
+    values = []
+    for index, row in enumerate(activity_rows):
+        values.append(
+            {
+                "index": index + 1,
+                "label": row.get("day", "")[5:],
+                "tweet_count": row.get("tweet_count", 0),
+            }
+        )
+
+    spec = {
+        "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+        "background": "transparent",
+        "height": 170,
+        "data": {"values": values},
+        "mark": {
+            "type": "area",
+            "line": {"color": "#ff6b57", "strokeWidth": 2},
+            "color": {
+                "x1": 1,
+                "y1": 1,
+                "x2": 1,
+                "y2": 0,
+                "gradient": "linear",
+                "stops": [
+                    {"offset": 0, "color": "rgba(255, 107, 87, 0.08)"},
+                    {"offset": 1, "color": "rgba(255, 61, 36, 0.55)"},
+                ],
+            },
+        },
+        "encoding": {
+            "x": {
+                "field": "label",
+                "type": "ordinal",
+                "axis": {
+                    "labelColor": "#cdb8a3",
+                    "title": None,
+                    "domain": False,
+                    "tickColor": "rgba(255,255,255,0.10)",
+                    "labelPadding": 10,
+                },
+            },
+            "y": {
+                "field": "tweet_count",
+                "type": "quantitative",
+                "axis": {
+                    "labelColor": "#cdb8a3",
+                    "title": None,
+                    "domain": False,
+                    "gridColor": "rgba(255,255,255,0.08)",
+                    "tickColor": "rgba(255,255,255,0.10)",
+                },
+            },
+            "tooltip": [
+                {"field": "label", "type": "ordinal", "title": "Jour"},
+                {"field": "tweet_count", "type": "quantitative", "title": "Tweets"},
+            ],
+        },
+        "config": {
+            "view": {"stroke": None},
+            "axis": {"labelFontSize": 12},
+        },
+    }
+    st.vega_lite_chart(spec, use_container_width=True)
+
+
+def render_home(repo, placeholder):
+    kpis = get_cached_mongo(repo, "home-kpis", lambda: get_ui_kpis(repo))
+    top_tweets = get_cached_mongo(repo, "home-top-tweets", lambda: get_ui_top_tweets(repo))
+    top_hashtags = get_cached_mongo(repo, "home-top-hashtags", lambda: get_ui_top_hashtags(repo))
+    activity = get_cached_mongo(repo, "home-activity", lambda: get_ui_activity_series(repo))
+
+    render_slide_header("Accueil", "Milano 2026", "Recap interactif des temps forts, comptes suivis et conversations autour des JO d'hiver Milano Cortina 2026.")
+
     st.markdown(
         """
-        <div class="milano-topbar">
-            <div class="milano-eyebrow">Milano dashboard</div>
-        """,
-        unsafe_allow_html=True,
-    )
-    render_page_nav(on_route_change, "Accueil")
-    st.markdown(
-        """
+        <div class="wrapped-hero-center-block">
             <div>
-                <div class="milano-title" style="margin-bottom:0.1rem;">Control Board</div>
-                <div class="milano-subtitle" style="margin-bottom:0;">Navigation rapide entre comptes, hashtags, tops et conversations.</div>
+                <div class="wrapped-route-label">Milano year review</div>
+                <div class="wrapped-title">2026 Milano Review</div>
+                <div class="wrapped-subtitle">Revivez les moments marquants de Milano Cortina 2026 a travers les tweets, hashtags phares et discussions les plus actives.</div>
             </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    left_col, right_col = st.columns([1.35, 1], gap="large")
+    stat_cols = st.columns(3)
+    with stat_cols[0]:
+        render_stat("Utilisateurs", kpis.get("user_count", placeholder), "Q1")
+    with stat_cols[1]:
+        render_stat("Tweets", kpis.get("tweet_count", placeholder), "Q2")
+    with stat_cols[2]:
+        render_stat("Hashtags", kpis.get("distinct_hashtag_count", placeholder), "Q3")
 
-    with left_col:
-        st.markdown("<div class='milano-panel-title'>Questions 1 a 3</div>", unsafe_allow_html=True)
-        metric_rows = [st.columns(2, gap="medium"), st.columns(2, gap="medium")]
-        metric_data = [
-            ("Q1 Profils", kpis.get("user_count", placeholder), "nombre total d'utilisateurs", "aqua", "◉"),
-            ("Q3 Hashtags", kpis.get("distinct_hashtag_count", placeholder), "hashtags distincts", "mint", "⌗"),
-            ("Q2 Tweets", kpis.get("tweet_count", placeholder), "nombre total de tweets", "violet", "✦"),
-            ("Acces", "5", "vues directes disponibles", "indigo", "➜"),
-        ]
-        for row_index, row in enumerate(metric_rows):
-            for col_index, col in enumerate(row):
-                title, value, note, variant, icon = metric_data[(row_index * 2) + col_index]
-                with col:
-                    render_metric_card(title, value, note, variant, icon)
-
-        st.markdown("<div class='milano-hero'>", unsafe_allow_html=True)
-        st.markdown("<div class='milano-panel-title'>Hub de recherche</div>", unsafe_allow_html=True)
-        search_cols = st.columns([1.05, 1.65, 0.8])
-        mode = search_cols[0].selectbox("Mode", ["Utilisateur", "Hashtag", "Texte"], key="home-search-mode")
-        query = search_cols[1].text_input(
-            "Recherche",
-            key="home-search-query",
-            placeholder="username, hashtag ou texte de tweet",
-        )
-        if search_cols[2].button("Explorer", use_container_width=True):
-            on_open_search(mode, query)
-            st.rerun()
-        st.markdown(
-            """
-            <div class="milano-label-row">
-                <span class="milano-chip-soft">Profil exact</span>
-                <span class="milano-chip-soft">Hashtag direct</span>
-                <span class="milano-chip-soft">Texte libre</span>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with right_col:
-        st.markdown("<div class='milano-panel-title'>Activity</div>", unsafe_allow_html=True)
-        st.caption("Volume des tweets sur les derniers jours disponibles.")
-        if activity:
-            counts = [row.get("tweet_count", 0) for row in activity]
-            st.area_chart({"Tweets": counts}, height=220)
-            labels = " · ".join(row.get("day", "")[5:] for row in activity)
-            st.caption(labels)
+    st.markdown("<div class='wrapped-divider'></div>", unsafe_allow_html=True)
+    grid_cols = st.columns(2)
+    with grid_cols[0]:
+        st.markdown("<div class='wrapped-section-title'>Moment fort</div>", unsafe_allow_html=True)
+        if top_tweets:
+            render_tweet_card(top_tweets[0], placeholder, open_profile, open_replies, key_prefix="home-top")
         else:
             render_placeholder(placeholder)
-
-        st.markdown("<div class='milano-panel-title'>Trending hashtags</div>", unsafe_allow_html=True)
-        st.caption("Raccourcis vers les hashtags les plus actifs.")
+    with grid_cols[1]:
+        st.markdown("<div class='wrapped-section-title'>Hashtag phare</div>", unsafe_allow_html=True)
         if top_hashtags:
-            render_bar_rows(
-                top_hashtags,
+            render_rank_rows(
+                top_hashtags[:5],
                 "hashtag",
                 "tweet_count",
                 placeholder,
-                key_prefix="home-tags",
-                on_click=lambda item: on_open_hashtag(item.get("hashtag", "")),
+                on_open=lambda item: open_hashtag(item.get("hashtag", "")),
+                key_prefix="home-hashtags",
             )
         else:
             render_placeholder(placeholder)
 
-    st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("<div class='wrapped-divider'></div>", unsafe_allow_html=True)
+    st.markdown("<div class='wrapped-section-title'>Activite recente</div>", unsafe_allow_html=True)
+    if activity:
+        render_dark_activity_chart(activity)
+    else:
+        render_placeholder(placeholder)
+
+    render_slide_footer("Accueil")
 
 
-def render_top10(repo, placeholder, on_open_hashtag, on_open_replies, on_open_profile, on_route_change):
-    render_page_nav(on_route_change, "Top 10")
-    render_page_header("Top 10", "Questions 12 et 13, plus un resume visuel pour la question 15.")
-    top_mode = st.radio("Classement", ["Tweets", "Hashtags"], horizontal=True)
+def render_top10(repo, placeholder):
+    render_slide_header("Top 10", "Top content", "Les tweets et hashtags les plus marquants du dataset.")
 
-    if top_mode == "Tweets":
-        items = get_ui_top_tweets(repo)
-        render_bar_rows(
+    mode = st.radio("Classement", ["Tweets", "Hashtags"], horizontal=True)
+
+    if mode == "Tweets":
+        items = get_cached_mongo(repo, "top10-tweets", lambda: get_ui_top_tweets(repo))
+        st.markdown("<div class='wrapped-section-title'>Top tweets</div>", unsafe_allow_html=True)
+        render_rank_rows(
             items,
             "tweet_id",
             "favorite_count",
             placeholder,
-            key_prefix="top-tweets",
-            on_click=lambda item: on_open_replies(item.get("tweet_id", "")),
+            on_open=lambda item: open_replies(item.get("tweet_id", "")),
+            key_prefix="top10-tweets",
         )
-        st.markdown("<div class='milano-divider'></div>", unsafe_allow_html=True)
-        st.markdown("<div class='milano-panel-title'>Extraits</div>", unsafe_allow_html=True)
-        for tweet in items[:5]:
-            render_tweet_card(
-                tweet,
-                placeholder,
-                on_open_profile,
-                on_open_replies,
-                key_prefix=f"top-preview-{tweet.get('tweet_id', 'x')}",
-            )
+        if items and items != placeholder:
+            st.markdown("<div class='wrapped-divider'></div>", unsafe_allow_html=True)
+            render_tweet_card(items[0], placeholder, open_profile, open_replies, key_prefix="top10-feature")
     else:
-        items = get_ui_top_hashtags(repo)
-        render_bar_rows(
+        items = get_cached_mongo(repo, "top10-hashtags", lambda: get_ui_top_hashtags(repo))
+        st.markdown("<div class='wrapped-section-title'>Top hashtags</div>", unsafe_allow_html=True)
+        render_rank_rows(
             items,
             "hashtag",
             "tweet_count",
             placeholder,
-            key_prefix="top-hashtags",
-            on_click=lambda item: on_open_hashtag(item.get("hashtag", "")),
+            on_open=lambda item: open_hashtag(item.get("hashtag", "")),
+            key_prefix="top10-hashtags",
         )
 
-    st.markdown("<div class='milano-divider'></div>", unsafe_allow_html=True)
-    st.markdown("<div class='milano-panel-title'>Discussion la plus longue</div>", unsafe_allow_html=True)
-    conversation = get_ui_longest_conversation_summary(repo)
+    st.markdown("<div class='wrapped-divider'></div>", unsafe_allow_html=True)
+    st.markdown("<div class='wrapped-section-title'>Discussion dominante</div>", unsafe_allow_html=True)
+    conversation = get_cached_mongo(repo, "top10-longest-conversation", lambda: get_ui_longest_conversation_summary(repo))
     if not conversation:
         render_placeholder(placeholder)
-        return
+    else:
+        summary_cols = st.columns(3)
+        with summary_cols[0]:
+            render_stat("Taille", conversation.get("conversation_size", placeholder), "Q15")
+        with summary_cols[1]:
+            render_stat("Chaine max", conversation.get("longest_reply_chain_length", placeholder), "profondeur")
+        with summary_cols[2]:
+            render_stat("Fins", conversation.get("ending_tweet_count", placeholder), "branches")
+        start_tweet = conversation.get("start_tweet")
+        if start_tweet:
+            render_tweet_card(start_tweet, placeholder, open_profile, open_replies, key_prefix="top10-conversation")
 
-    info_cols = st.columns(3)
-    with info_cols[0]:
-        render_card("Taille", conversation.get("conversation_size", placeholder), "tweets", kind="kpi")
-    with info_cols[1]:
-        render_card(
-            "Chaine max",
-            conversation.get("longest_reply_chain_length", placeholder),
-            "profondeur de reponses",
-            kind="kpi",
-        )
-    with info_cols[2]:
-        render_card("Fins", conversation.get("ending_tweet_count", placeholder), "branches terminales", kind="kpi")
-
-    start_tweet = conversation.get("start_tweet")
-    if start_tweet:
-        render_tweet_card(
-            start_tweet,
-            placeholder,
-            on_open_profile,
-            on_open_replies,
-            key_prefix="top-longest-conversation",
-        )
+    render_slide_footer("Top 10")
 
 
-def render_search(repo, placeholder, on_open_profile, on_open_hashtag, on_open_replies, on_route_change):
-    render_page_nav(on_route_change, "Recherche")
-    render_page_header("Recherche", "Recherche specifique par utilisateur, hashtag ou texte.")
-    mode = st.radio(
-        "Mode de recherche",
-        ["Utilisateur", "Hashtag", "Texte"],
-        horizontal=True,
-        index=["Utilisateur", "Hashtag", "Texte"].index(st.session_state.search_mode),
-    )
-    query = st.text_input("Recherche", value=st.session_state.search_query, placeholder="Tape ta recherche")
+def render_search(repo, placeholder):
+    render_slide_header("Recherche", "Find anything", "Recherche utilisateur, hashtag ou texte dans le style d'une slide interactive.")
+
+    controls = st.columns([1, 1.8, 0.7])
+    mode = controls[0].selectbox("Mode", ["Utilisateur", "Hashtag", "Texte"], index=["Utilisateur", "Hashtag", "Texte"].index(st.session_state.search_mode))
+    query = controls[1].text_input("Recherche", value=st.session_state.search_query, placeholder="username, hashtag ou texte")
     st.session_state.search_mode = mode
     st.session_state.search_query = query
+    if controls[2].button("Go", use_container_width=True):
+        st.rerun()
 
     if not query.strip():
-        st.caption("Renseigne une recherche pour afficher des resultats.")
+        render_placeholder("Type a search")
+        render_slide_footer("Recherche")
         return
 
     if mode == "Utilisateur":
-        rows = search_ui_users(repo, query)
-        if rows == placeholder:
+        rows = get_cached_mongo(repo, "search-users", lambda: search_ui_users(repo, query), mode, query.strip().lower())
+        if rows == placeholder or not rows:
             render_placeholder(placeholder)
-            return
-        if not rows:
-            st.caption("Aucun utilisateur trouve.")
-            return
-        for user in rows:
-            cols = st.columns([3, 1])
-            cols[0].markdown(
-                f"**@{user.get('username', placeholder)}**  \n{user.get('role', placeholder)} • {user.get('country', placeholder)}"
-            )
-            if cols[1].button("Ouvrir", key=f"search-user-{user.get('user_id', '')}"):
-                on_open_profile(user_id=user.get("user_id", ""), username=user.get("username", ""))
-                st.rerun()
-
+        else:
+            st.markdown("<div class='wrapped-section-title'>Resultats utilisateurs</div>", unsafe_allow_html=True)
+            for user in rows[:6]:
+                cols = st.columns([2.4, 0.7])
+                cols[0].markdown(
+                    f"<div class='wrapped-panel'><strong>@{user.get('username', placeholder)}</strong><br>{user.get('role', placeholder)} · {user.get('country', placeholder)}</div>",
+                    unsafe_allow_html=True,
+                )
+                if cols[1].button("Voir", key=f"search-user-{user.get('user_id', '')}"):
+                    open_profile(user_id=user.get("user_id", ""), username=user.get("username", ""))
+                    st.rerun()
     elif mode == "Hashtag":
-        rows = search_ui_hashtags(repo, query)
-        render_bar_rows(
+        rows = get_cached_mongo(repo, "search-hashtags", lambda: search_ui_hashtags(repo, query), mode, query.strip().lower())
+        st.markdown("<div class='wrapped-section-title'>Resultats hashtags</div>", unsafe_allow_html=True)
+        render_rank_rows(
             rows,
             "hashtag",
             "tweet_count",
             placeholder,
-            key_prefix="search-hashtag",
-            on_click=lambda item: on_open_hashtag(item.get("hashtag", "")),
+            on_open=lambda item: open_hashtag(item.get("hashtag", "")),
+            key_prefix="search-hashtags",
         )
-
     else:
-        rows = search_ui_tweets_by_text(repo, query)
-        if rows == placeholder:
+        rows = get_cached_mongo(repo, "search-text", lambda: search_ui_tweets_by_text(repo, query), mode, query.strip().lower())
+        if rows == placeholder or not rows:
             render_placeholder(placeholder)
-            return
-        if not rows:
-            st.caption("Aucun tweet trouve.")
-            return
-        for tweet in rows:
-            render_tweet_card(
-                tweet,
-                placeholder,
-                on_open_profile,
-                on_open_replies,
-                key_prefix=f"search-tweet-{tweet.get('tweet_id', 'x')}",
-            )
+        else:
+            st.markdown("<div class='wrapped-section-title'>Resultats tweets</div>", unsafe_allow_html=True)
+            for tweet in rows[:6]:
+                render_tweet_card(tweet, placeholder, open_profile, open_replies, key_prefix=f"search-{tweet.get('tweet_id', 'x')}")
+
+    render_slide_footer("Recherche")
 
 
-def render_profile(repo, placeholder, on_open_profile, on_open_replies, on_route_change):
-    render_page_nav(on_route_change, "Profil")
-    render_page_header("Profil utilisateur", "Page detaillee avec tweets recents.")
+def render_profile(repo, placeholder):
+    render_slide_header("Profil", "Creator focus", "Lecture profilee d'un compte et de ses tweets recents.")
+
     selected_user = None
     if st.session_state.selected_username:
-        selected_user = get_ui_user_by_username(repo, st.session_state.selected_username)
+        selected_user = get_cached_mongo(
+            repo,
+            "profile-by-username",
+            lambda: get_ui_user_by_username(repo, st.session_state.selected_username),
+            st.session_state.selected_username.lower(),
+        )
     if not selected_user and st.session_state.selected_user_id:
-        selected_user = get_ui_user_by_id(repo, st.session_state.selected_user_id)
+        selected_user = get_cached_mongo(
+            repo,
+            "profile-by-id",
+            lambda: get_ui_user_by_id(repo, st.session_state.selected_user_id),
+            st.session_state.selected_user_id,
+        )
 
     if not selected_user:
-        lookup = st.text_input("Charger un profil", placeholder="username exact")
-        if st.button("Afficher le profil", key="profile-lookup"):
-            on_open_profile(username=lookup)
+        lookup = st.text_input("Username exact", placeholder="MilanoOps")
+        if st.button("Afficher", use_container_width=True):
+            open_profile(username=lookup)
             st.rerun()
-        st.caption("Selectionne un utilisateur depuis Recherche ou saisis un username exact.")
+        render_placeholder("Select a profile")
+        render_slide_footer("Profil")
         return
 
     st.markdown(
         f"""
-        <div class="milano-card">
-            <div class="milano-eyebrow">Profil</div>
-            <div class="milano-panel-title">@{selected_user.get('username', placeholder)}</div>
-            <div class="milano-meta">{selected_user.get('role', placeholder)} • {selected_user.get('country', placeholder)}</div>
-            <div class="milano-muted">Creation : {selected_user.get('created_at', placeholder)}</div>
+        <div class="wrapped-panel">
+            <div class="wrapped-route-label">Compte</div>
+            <div class="wrapped-title" style="font-size:2.3rem; text-transform:none;">@{selected_user.get('username', placeholder)}</div>
+            <div class="wrapped-subtitle">{selected_user.get('role', placeholder)} · {selected_user.get('country', placeholder)} · cree le {selected_user.get('created_at', placeholder)}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
-    st.markdown("<div class='milano-panel-title'>Ses tweets</div>", unsafe_allow_html=True)
-    tweets = get_ui_tweets_by_user(repo, selected_user.get("user_id", ""))
-    if tweets == placeholder:
+
+    tweets = get_cached_mongo(
+        repo,
+        "profile-tweets",
+        lambda: get_ui_tweets_by_user(repo, selected_user.get("user_id", "")),
+        selected_user.get("user_id", ""),
+    )
+    st.markdown("<div class='wrapped-section-title'>Ses tweets recents</div>", unsafe_allow_html=True)
+    if tweets == placeholder or not tweets:
         render_placeholder(placeholder)
-    elif not tweets:
-        st.caption("Aucun tweet pour ce profil.")
     else:
-        for tweet in tweets[:12]:
-            render_tweet_card(
-                tweet,
-                placeholder,
-                on_open_profile,
-                on_open_replies,
-                key_prefix=f"profile-{tweet.get('tweet_id', 'x')}",
-            )
+        for tweet in tweets[:5]:
+            render_tweet_card(tweet, placeholder, open_profile, open_replies, key_prefix=f"profile-{tweet.get('tweet_id', 'x')}")
+
+    render_slide_footer("Profil")
 
 
-def render_hashtag(repo, placeholder, on_open_profile, on_open_replies, on_route_change):
-    render_page_nav(on_route_change, "Hashtag")
-    render_page_header("Hashtag", "Questions 4 et 5 sur l'activite d'un hashtag.")
+def render_hashtag(placeholder):
+    render_slide_header("Hashtag", "Hashtag spotlight", "Espace reserve aux questions 4 et 5. Tant que ce n'est pas branche, la slide reste en attente.")
     render_placeholder(placeholder)
+    render_slide_footer("Hashtag")
 
 
-def render_replies(repo, placeholder, on_open_profile, on_open_replies, on_route_change):
-    render_page_nav(on_route_change, "Reponses")
-    render_page_header("Reponses", "Question 6 pour la liste globale, puis questions 14, 15 et 16 pour le detail d'une conversation.")
+def render_replies(repo, placeholder):
+    render_slide_header("Reponses", "Thread review", "Question 6 pour la liste globale, puis detail de conversation pour les threads.")
 
-    st.markdown("<div class='milano-panel-title'>Q6 - Tous les tweets qui sont des reponses</div>", unsafe_allow_html=True)
-    reply_tweets = get_ui_reply_tweets(repo)
-    if reply_tweets == placeholder:
+    st.markdown("<div class='wrapped-section-title'>Q6 · Tous les tweets qui sont des reponses</div>", unsafe_allow_html=True)
+    reply_tweets = get_cached_mongo(repo, "reply-tweets", lambda: get_ui_reply_tweets(repo))
+    if reply_tweets == placeholder or not reply_tweets:
         render_placeholder(placeholder)
-    elif not reply_tweets:
-        st.caption("Aucun tweet-reponse dans le dataset.")
     else:
-        st.caption("Liste globale des tweets dont `in_reply_to_tweet_id` n'est pas nul.")
-        for reply_tweet in reply_tweets[:20]:
-            render_tweet_card(
-                reply_tweet,
-                placeholder,
-                on_open_profile,
-                on_open_replies,
-                key_prefix=f"reply-list-{reply_tweet.get('tweet_id', 'x')}",
-            )
+        for tweet in reply_tweets[:5]:
+            render_tweet_card(tweet, placeholder, open_profile, open_replies, key_prefix=f"reply-list-{tweet.get('tweet_id', 'x')}")
 
-    st.markdown("<div class='milano-panel-title'>Detail d'une conversation</div>", unsafe_allow_html=True)
-    tweet_id = st.session_state.selected_tweet_id
-    manual = st.text_input("Tweet ID", value=tweet_id, placeholder="T0001")
-    if manual != tweet_id:
+    st.markdown("<div class='wrapped-divider'></div>", unsafe_allow_html=True)
+    st.markdown("<div class='wrapped-section-title'>Selection d'un tweet</div>", unsafe_allow_html=True)
+    manual = st.text_input("Tweet ID", value=st.session_state.selected_tweet_id, placeholder="T0001")
+    if manual != st.session_state.selected_tweet_id:
         st.session_state.selected_tweet_id = manual
-        tweet_id = manual
 
-    if not tweet_id.strip():
-        st.caption("Ouvre un tweet depuis la liste ci-dessus, Top 10 ou Recherche.")
+    if not st.session_state.selected_tweet_id.strip():
+        render_placeholder("Select a reply")
+        render_slide_footer("Reponses")
         return
 
-    tweet = get_ui_tweet_by_id(repo, tweet_id)
+    tweet_id = st.session_state.selected_tweet_id
+    tweet = get_cached_mongo(repo, "reply-selected", lambda: get_ui_tweet_by_id(repo, tweet_id), tweet_id)
     if not tweet:
         render_placeholder(placeholder)
+        render_slide_footer("Reponses")
         return
 
-    st.markdown("<div class='milano-panel-title'>Tweet selectionne</div>", unsafe_allow_html=True)
-    render_tweet_card(
-        tweet,
-        placeholder,
-        on_open_profile,
-        on_open_replies,
-        key_prefix=f"reply-focus-{tweet.get('tweet_id', 'x')}",
-        show_reply_button=False,
-    )
-
-    parent = get_ui_parent_tweet(repo, tweet)
-    st.markdown("<div class='milano-panel-title'>Tweet parent</div>", unsafe_allow_html=True)
-    if tweet.get("in_reply_to_tweet_id"):
-        if parent:
-            render_tweet_card(
-                parent,
-                placeholder,
-                on_open_profile,
-                on_open_replies,
-                key_prefix=f"reply-parent-{parent.get('tweet_id', 'x')}",
-                show_reply_button=False,
-            )
+    grid_cols = st.columns(2)
+    with grid_cols[0]:
+        st.markdown("<div class='wrapped-section-title'>Tweet selectionne</div>", unsafe_allow_html=True)
+        render_tweet_card(tweet, placeholder, open_profile, open_replies, key_prefix=f"reply-focus-{tweet_id}", show_reply_button=False)
+        st.markdown("<div class='wrapped-section-title'>Tweet parent</div>", unsafe_allow_html=True)
+        parent = get_cached_mongo(
+            repo,
+            "reply-parent",
+            lambda: get_ui_parent_tweet(repo, tweet),
+            tweet.get("tweet_id", ""),
+            tweet.get("in_reply_to_tweet_id", ""),
+        )
+        if tweet.get("in_reply_to_tweet_id") and parent:
+            render_tweet_card(parent, placeholder, open_profile, open_replies, key_prefix=f"reply-parent-{tweet_id}", show_reply_button=False)
         else:
             render_placeholder(placeholder)
-    else:
-        st.caption("Ce tweet est deja le point de depart.")
 
-    st.markdown("<div class='milano-panel-title'>Reponses directes</div>", unsafe_allow_html=True)
-    replies = get_ui_replies_for_tweet(repo, tweet.get("tweet_id", ""))
-    if replies == placeholder:
-        render_placeholder(placeholder)
-    elif not replies:
-        st.caption("Aucune reponse directe.")
-    else:
-        for reply in replies:
-            render_tweet_card(
-                reply,
-                placeholder,
-                on_open_profile,
-                on_open_replies,
-                key_prefix=f"reply-child-{reply.get('tweet_id', 'x')}",
-                show_reply_button=False,
-            )
+    with grid_cols[1]:
+        st.markdown("<div class='wrapped-section-title'>Reponses directes</div>", unsafe_allow_html=True)
+        replies = get_cached_mongo(
+            repo,
+            "reply-children",
+            lambda: get_ui_replies_for_tweet(repo, tweet.get("tweet_id", "")),
+            tweet.get("tweet_id", ""),
+        )
+        if replies == placeholder or not replies:
+            render_placeholder(placeholder)
+        else:
+            for reply in replies[:4]:
+                render_tweet_card(reply, placeholder, open_profile, open_replies, key_prefix=f"reply-child-{reply.get('tweet_id', 'x')}", show_reply_button=False)
 
-    st.markdown("<div class='milano-panel-title'>Conversation etendue</div>", unsafe_allow_html=True)
-    conversation = get_ui_extended_conversation(repo, tweet.get("tweet_id", ""))
+    st.markdown("<div class='wrapped-divider'></div>", unsafe_allow_html=True)
+    st.markdown("<div class='wrapped-section-title'>Conversation etendue</div>", unsafe_allow_html=True)
+    conversation = get_cached_mongo(
+        repo,
+        "reply-conversation",
+        lambda: get_ui_extended_conversation(repo, tweet.get("tweet_id", "")),
+        tweet.get("tweet_id", ""),
+    )
     if not conversation:
         render_placeholder(placeholder)
-        return
-
-    summary_cols = st.columns(4)
-    with summary_cols[0]:
-        render_card(
-            "Taille",
-            conversation.get("conversation_size", placeholder),
-            "tweets dans la conversation",
-            kind="kpi",
-        )
-    with summary_cols[1]:
-        render_card(
-            "Chaine max",
-            conversation.get("longest_reply_chain_length", placeholder),
-            "longueur maximale de reponses",
-            kind="kpi",
-        )
-    with summary_cols[2]:
-        render_card(
-            "Reponses directes",
-            conversation.get("direct_reply_count", placeholder),
-            "a partir du tweet initial",
-            kind="kpi",
-        )
-    with summary_cols[3]:
-        longest_label = "oui" if conversation.get("is_longest") else "non"
-        render_card("Plus longue", longest_label, "sur l'ensemble du dataset", kind="kpi")
-
-    start_tweet = conversation.get("start_tweet")
-    st.markdown("<div class='milano-panel-title'>Point de depart</div>", unsafe_allow_html=True)
-    if start_tweet:
-        render_tweet_card(
-            start_tweet,
-            placeholder,
-            on_open_profile,
-            on_open_replies,
-            key_prefix=f"reply-root-{start_tweet.get('tweet_id', 'x')}",
-            show_reply_button=False,
-        )
     else:
-        render_placeholder(placeholder)
+        stat_cols = st.columns(4)
+        with stat_cols[0]:
+            render_stat("Taille", conversation.get("conversation_size", placeholder), "Q14/Q16")
+        with stat_cols[1]:
+            render_stat("Chaine", conversation.get("longest_reply_chain_length", placeholder), "Q15")
+        with stat_cols[2]:
+            render_stat("Directes", conversation.get("direct_reply_count", placeholder), "a partir du debut")
+        with stat_cols[3]:
+            render_stat("Plus longue", "oui" if conversation.get("is_longest") else "non", "dataset global")
 
-    st.markdown("<div class='milano-panel-title'>Fins de conversation</div>", unsafe_allow_html=True)
-    ending_tweets = conversation.get("ending_tweets", [])
-    if not ending_tweets:
-        st.caption("Pas de fin distincte a afficher pour cette conversation.")
-    else:
-        for ending_tweet in ending_tweets:
-            render_tweet_card(
-                ending_tweet,
-                placeholder,
-                on_open_profile,
-                on_open_replies,
-                key_prefix=f"reply-ending-{ending_tweet.get('tweet_id', 'x')}",
-                show_reply_button=False,
-            )
+    render_slide_footer("Reponses")
 
 
-def render_network(graph_context, placeholder, on_route_change):
-    render_page_nav(on_route_change, "Reseau")
-    render_page_header("Reseau", "Questions 7 a 11 sur les relations de suivi dans Neo4j.")
-
-    render_question_block(
-        "Q7",
-        "Followers de MilanoOps",
-        get_ui_q7_followers(graph_context),
-        placeholder,
-    )
-    render_question_block(
-        "Q8",
-        "Utilisateurs suivis par MilanoOps",
-        get_ui_q8_following(graph_context),
-        placeholder,
-    )
-    render_question_block(
-        "Q9",
-        "Relations reciproques avec MilanoOps",
-        get_ui_q9_mutual_connections(graph_context),
-        placeholder,
-    )
-    render_question_block(
-        "Q10",
-        "Utilisateurs avec plus de 10 followers",
-        get_ui_q10_users_with_more_than_ten_followers(graph_context),
-        placeholder,
-    )
-    render_question_block(
-        "Q11",
-        "Utilisateurs qui suivent plus de 5 utilisateurs",
-        get_ui_q11_users_following_more_than_five_users(graph_context),
-        placeholder,
-    )
+def render_network(placeholder):
+    render_slide_header("Reseau", "Social graph", "Questions 7 a 11 sur les relations de suivi dans Neo4j.")
+    graph_context = get_neo4j_context()
+    render_question_block("Q7", "Followers de MilanoOps", get_cached_neo4j("q7", lambda: get_ui_q7_followers(graph_context)), placeholder)
+    render_question_block("Q8", "Utilisateurs suivis par MilanoOps", get_cached_neo4j("q8", lambda: get_ui_q8_following(graph_context)), placeholder)
+    render_question_block("Q9", "Relations reciproques avec MilanoOps", get_cached_neo4j("q9", lambda: get_ui_q9_mutual_connections(graph_context)), placeholder)
+    render_question_block("Q10", "Utilisateurs avec plus de 10 followers", get_cached_neo4j("q10", lambda: get_ui_q10_users_with_more_than_ten_followers(graph_context)), placeholder)
+    render_question_block("Q11", "Utilisateurs qui suivent plus de 5 utilisateurs", get_cached_neo4j("q11", lambda: get_ui_q11_users_following_more_than_five_users(graph_context)), placeholder)
+    render_slide_footer("Reseau")
 
 
 def run_streamlit_ui():
@@ -1127,38 +1293,37 @@ def run_streamlit_ui():
             "conda run -n cours streamlit run src/app_milano/utils/display.py"
         )
 
-    st.set_page_config(page_title="Milano Streamlit", page_icon="M", layout="wide")
+    st.set_page_config(page_title="Milano Review", page_icon="▶", layout="wide")
     load_env_file(required=False)
     init_state()
-    dev_mode = os.getenv("APP_MILANO_UI_MODE") != "desktop"
-    apply_styles(dev_mode=dev_mode)
-    repo = create_mongo_context(PLACEHOLDER)
-    graph_context = create_neo4j_context(PLACEHOLDER)
+    transition_direction = st.session_state.transition_direction
+    apply_styles(dev_mode=os.getenv("APP_MILANO_UI_MODE") != "desktop", transition_direction=transition_direction)
+    st.session_state.transition_direction = "none"
+    repo = get_mongo_context()
 
     try:
-        if dev_mode:
-            render_sidebar(repo, ROUTES, st.session_state.route, set_route)
+        if os.getenv("APP_MILANO_UI_MODE") != "desktop":
+            render_dev_sidebar(repo)
+        render_edge_navigation()
+
         route = st.session_state.route
         if route == "Accueil":
-            render_home(repo, PLACEHOLDER, open_search, open_profile, open_hashtag, open_replies, set_route)
+            render_home(repo, PLACEHOLDER)
         elif route == "Top 10":
-            render_top10(repo, PLACEHOLDER, open_hashtag, open_replies, open_profile, set_route)
+            render_top10(repo, PLACEHOLDER)
         elif route == "Recherche":
-            render_search(repo, PLACEHOLDER, open_profile, open_hashtag, open_replies, set_route)
+            render_search(repo, PLACEHOLDER)
         elif route == "Profil":
-            render_profile(repo, PLACEHOLDER, open_profile, open_replies, set_route)
+            render_profile(repo, PLACEHOLDER)
         elif route == "Hashtag":
-            render_hashtag(repo, PLACEHOLDER, open_profile, open_replies, set_route)
+            render_hashtag(PLACEHOLDER)
         elif route == "Reponses":
-            render_replies(repo, PLACEHOLDER, open_profile, open_replies, set_route)
+            render_replies(repo, PLACEHOLDER)
         else:
-            render_network(graph_context, PLACEHOLDER, set_route)
+            render_network(PLACEHOLDER)
     except Exception:
         st.error("Erreur de chargement de l'interface.")
         st.markdown("...........")
-    finally:
-        close_mongo_context(repo)
-        close_neo4j_context(graph_context)
 
 
 if __name__ == "__main__":
