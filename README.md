@@ -60,6 +60,7 @@ Password: neo4j_password
 
 ### Yanis GOBEREAU
 
+- [x] restaurer les agregations MongoDB de discussions/conversations deja faites : `get_thread_starters`, `get_longest_conversation`, `get_conversation_boundaries`
 - [ ] verifier la connexion Neo4j en local
 - [ ] finaliser l'import Neo4j a partir du dataset MongoDB
 - [ ] completer les relations `FOLLOWS` et `RETWEETS`

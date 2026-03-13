@@ -155,3 +155,149 @@ def get_top_hashtags(db: Database) -> list[dict]:
             ]
         )
     )
+
+
+# Aggregation Mongo: tweets qui initient une discussion
+def get_thread_starters(db: Database) -> list[dict]:
+    return list(
+        db.tweets.aggregate(
+            [
+                {"$match": {"in_reply_to_tweet_id": None}},
+                {
+                    "$lookup": {
+                        "from": "tweets",
+                        "localField": "tweet_id",
+                        "foreignField": "in_reply_to_tweet_id",
+                        "as": "direct_replies",
+                    }
+                },
+                {"$match": {"direct_replies.0": {"$exists": True}}},
+                {
+                    "$project": {
+                        "_id": 0,
+                        "tweet_id": 1,
+                        "user_id": 1,
+                        "favorite_count": 1,
+                        "created_at": 1,
+                        "text": 1,
+                        "direct_reply_count": {"$size": "$direct_replies"},
+                    }
+                },
+                {"$sort": {"created_at": 1, "tweet_id": 1}},
+            ]
+        )
+    )
+
+
+# Aggregation Mongo: discussion la plus longue
+def get_longest_conversation(db: Database) -> dict:
+    rows = list(
+        db.tweets.aggregate(
+            [
+                {"$match": {"in_reply_to_tweet_id": None}},
+                {
+                    "$graphLookup": {
+                        "from": "tweets",
+                        "startWith": "$tweet_id",
+                        "connectFromField": "tweet_id",
+                        "connectToField": "in_reply_to_tweet_id",
+                        "as": "descendants",
+                        "depthField": "depth",
+                    }
+                },
+                {"$match": {"descendants.0": {"$exists": True}}},
+                {
+                    "$addFields": {
+                        "conversation_size": {"$add": [1, {"$size": "$descendants"}]},
+                        "max_depth_value": {"$max": "$descendants.depth"},
+                    }
+                },
+                {
+                    "$addFields": {
+                        "longest_reply_chain_length": {"$add": ["$max_depth_value", 2]}
+                    }
+                },
+                {
+                    "$sort": {
+                        "conversation_size": -1,
+                        "longest_reply_chain_length": -1,
+                        "tweet_id": 1,
+                    }
+                },
+                {"$limit": 1},
+                {
+                    "$project": {
+                        "_id": 0,
+                        "start_tweet_id": "$tweet_id",
+                        "start_user_id": "$user_id",
+                        "start_text": "$text",
+                        "conversation_size": 1,
+                        "longest_reply_chain_length": 1,
+                        "descendant_tweet_ids": "$descendants.tweet_id",
+                    }
+                },
+            ]
+        )
+    )
+    return rows[0] if rows else {}
+
+
+# Aggregation Mongo: debut et fin de chaque conversation
+def get_conversation_boundaries(db: Database) -> list[dict]:
+    return list(
+        db.tweets.aggregate(
+            [
+                {"$match": {"in_reply_to_tweet_id": None}},
+                {
+                    "$graphLookup": {
+                        "from": "tweets",
+                        "startWith": "$tweet_id",
+                        "connectFromField": "tweet_id",
+                        "connectToField": "in_reply_to_tweet_id",
+                        "as": "descendants",
+                        "depthField": "depth",
+                    }
+                },
+                {"$match": {"descendants.0": {"$exists": True}}},
+                {"$addFields": {"reply_targets": "$descendants.in_reply_to_tweet_id"}},
+                {
+                    "$addFields": {
+                        "ending_tweets": {
+                            "$filter": {
+                                "input": "$descendants",
+                                "as": "tweet",
+                                "cond": {
+                                    "$not": [{"$in": ["$$tweet.tweet_id", "$reply_targets"]}]
+                                },
+                            }
+                        }
+                    }
+                },
+                {
+                    "$project": {
+                        "_id": 0,
+                        "conversation_size": {"$add": [1, {"$size": "$descendants"}]},
+                        "start_tweet": {
+                            "tweet_id": "$tweet_id",
+                            "user_id": "$user_id",
+                            "created_at": "$created_at",
+                            "text": "$text",
+                        },
+                        "ending_tweets": {
+                            "$map": {
+                                "input": "$ending_tweets",
+                                "as": "tweet",
+                                "in": {
+                                    "tweet_id": "$$tweet.tweet_id",
+                                    "user_id": "$$tweet.user_id",
+                                    "created_at": "$$tweet.created_at",
+                                    "text": "$$tweet.text",
+                                },
+                            }
+                        },
+                    }
+                },
+                {"$sort": {"start_tweet.tweet_id": 1}},
+            ]
+        )
+    )
