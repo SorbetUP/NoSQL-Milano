@@ -193,6 +193,7 @@ cython_debug/
 
 src/docker/mongo/data/
 src/docker/neo4j/data/
+src/docker/neo4j/src/docker/neo4j/data/
 
 # PyPI configuration file
 .pypirc
