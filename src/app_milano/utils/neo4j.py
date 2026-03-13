@@ -2,6 +2,8 @@ import time
 
 from neo4j import Driver, GraphDatabase
 
+from app_milano.config import load_env_file, load_settings
+
 
 def wait_for_neo4j(uri: str, user: str, password: str, timeout: int = 120) -> Driver:
     deadline = time.time() + timeout
@@ -118,3 +120,72 @@ def get_longest_discussion(driver: Driver) -> dict:
 # Question 16: debut et fin de chaque conversation
 def get_conversation_start_and_end(driver: Driver) -> list[dict]:
     pass
+
+
+def create_neo4j_context(placeholder="in progress"):
+    context = {
+        "placeholder": placeholder,
+        "settings": None,
+        "driver": None,
+    }
+    if not load_env_file(required=False):
+        return context
+
+    try:
+        context["settings"] = load_settings()
+        context["driver"] = GraphDatabase.driver(
+            context["settings"].neo4j_bolt_uri,
+            auth=(context["settings"].neo4j_user, context["settings"].neo4j_password),
+        )
+        with context["driver"].session() as session:
+            session.run("RETURN 1").consume()
+    except Exception:
+        if context["driver"]:
+            context["driver"].close()
+        context["driver"] = None
+    return context
+
+
+def close_neo4j_context(context):
+    if context and context["driver"]:
+        context["driver"].close()
+
+
+def _normalize_result(context, value):
+    if value is None:
+        return context["placeholder"]
+    if isinstance(value, dict) and not value:
+        return context["placeholder"]
+    if isinstance(value, list) and not value:
+        return context["placeholder"]
+    return value
+
+
+def get_ui_q7_followers(context):
+    if not context["driver"]:
+        return context["placeholder"]
+    return _normalize_result(context, get_milanoops_followers(context["driver"]))
+
+
+def get_ui_q8_following(context):
+    if not context["driver"]:
+        return context["placeholder"]
+    return _normalize_result(context, get_milanoops_following(context["driver"]))
+
+
+def get_ui_q9_mutual_connections(context):
+    if not context["driver"]:
+        return context["placeholder"]
+    return _normalize_result(context, get_mutual_connections_with_milanoops(context["driver"]))
+
+
+def get_ui_q10_users_with_more_than_ten_followers(context):
+    if not context["driver"]:
+        return context["placeholder"]
+    return _normalize_result(context, get_users_with_more_than_ten_followers(context["driver"]))
+
+
+def get_ui_q11_users_following_more_than_five_users(context):
+    if not context["driver"]:
+        return context["placeholder"]
+    return _normalize_result(context, get_users_following_more_than_five_users(context["driver"]))

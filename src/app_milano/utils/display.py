@@ -1,13 +1,10 @@
 import atexit
-import json
 import os
-import re
 import socket
 import subprocess
 import sys
 import time
 import urllib.request
-from collections import defaultdict
 from pathlib import Path
 
 
@@ -21,27 +18,37 @@ if str(SRC_DIR) not in sys.path:
 
 import streamlit as st
 import webview
-from neo4j import GraphDatabase
-from pymongo import MongoClient
 from streamlit.runtime.scriptrunner_utils.script_run_context import get_script_run_ctx
 
-from app_milano.config import DATA_DIR, Settings, load_env_file, load_settings
+from app_milano.config import Settings, load_env_file
 from app_milano.utils.mongo import (
-    count_distinct_hashtags,
-    count_tweets,
-    count_users,
-    get_conversation_boundaries,
-    get_longest_conversation,
-    get_top_hashtags,
-    get_top_tweets,
-    get_thread_starters,
+    close_mongo_context,
+    create_mongo_context,
+    get_mongo_source,
+    get_ui_activity_series,
+    get_ui_extended_conversation,
+    get_ui_kpis,
+    get_ui_longest_conversation_summary,
+    get_ui_parent_tweet,
+    get_ui_replies_for_tweet,
+    get_ui_top_hashtags,
+    get_ui_top_tweets,
+    get_ui_tweet_by_id,
+    get_ui_tweets_by_user,
+    get_ui_user_by_id,
+    get_ui_user_by_username,
+    search_ui_hashtags,
+    search_ui_tweets_by_text,
+    search_ui_users,
 )
 from app_milano.utils.neo4j import (
-    get_milanoops_followers,
-    get_milanoops_following,
-    get_mutual_connections_with_milanoops,
-    get_users_following_more_than_five_users,
-    get_users_with_more_than_ten_followers,
+    close_neo4j_context,
+    create_neo4j_context,
+    get_ui_q10_users_with_more_than_ten_followers,
+    get_ui_q11_users_following_more_than_five_users,
+    get_ui_q7_followers,
+    get_ui_q8_following,
+    get_ui_q9_mutual_connections,
 )
 
 
@@ -124,715 +131,6 @@ def open_search(mode, query):
     st.session_state.search_mode = mode
     st.session_state.search_query = query or ""
     st.session_state.route = "Recherche"
-
-
-class MilanoRepository:
-    def __init__(self):
-        self.source = "JSON local"
-        self.client = None
-        self.db = None
-        self.neo4j_driver = None
-        self.settings = None
-        self.users, self.tweets = self._load_dataset()
-        self.users_by_id = {user["user_id"]: user for user in self.users}
-        self.users_by_username = {user["username"].lower(): user for user in self.users}
-        self._connect_mongo()
-        self._connect_neo4j()
-
-    def _load_dataset(self):
-        users = json.loads((DATA_DIR / "users.json").read_text(encoding="utf-8"))
-        tweets = json.loads((DATA_DIR / "tweets.json").read_text(encoding="utf-8"))
-        return users, tweets
-
-    def _connect_mongo(self):
-        if not load_env_file(required=False):
-            return
-
-        try:
-            self.settings = load_settings()
-            self.client = MongoClient(self.settings.mongo_app_uri, serverSelectionTimeoutMS=2500)
-            self.client.admin.command("ping")
-            self.db = self.client[self.settings.mongo_app_db]
-            self.source = "MongoDB"
-        except Exception:
-            if self.client:
-                self.client.close()
-            self.client = None
-            self.db = None
-            self.settings = None
-            self.source = "JSON local"
-
-    def _connect_neo4j(self):
-        if not load_env_file(required=False):
-            return
-
-        try:
-            if self.settings is None:
-                self.settings = load_settings()
-            self.neo4j_driver = GraphDatabase.driver(
-                self.settings.neo4j_bolt_uri,
-                auth=(self.settings.neo4j_user, self.settings.neo4j_password),
-            )
-            with self.neo4j_driver.session() as session:
-                session.run("RETURN 1").consume()
-        except Exception:
-            if self.neo4j_driver:
-                self.neo4j_driver.close()
-            self.neo4j_driver = None
-
-    def close(self):
-        if self.client:
-            self.client.close()
-        if self.neo4j_driver:
-            self.neo4j_driver.close()
-
-    def _clean_doc(self, doc):
-        if not doc:
-            return None
-        cleaned = dict(doc)
-        cleaned.pop("_id", None)
-        return cleaned
-
-    def _normalize_hashtag(self, hashtag):
-        return hashtag.strip().lstrip("#").lower()
-
-    def _attach_username(self, tweet):
-        if not tweet:
-            return None
-        enriched = dict(tweet)
-        if not enriched.get("username"):
-            user = self.users_by_id.get(enriched.get("user_id"), {})
-            enriched["username"] = user.get("username", "unknown")
-        return enriched
-
-    def _sort_by_created_at(self, rows, reverse=False):
-        return sorted(rows, key=lambda item: (item.get("created_at", ""), item.get("tweet_id", "")), reverse=reverse)
-
-    def get_kpis(self):
-        if self.db is not None:
-            return {
-                "user_count": count_users(self.db),
-                "tweet_count": count_tweets(self.db),
-                "distinct_hashtag_count": count_distinct_hashtags(self.db),
-            }
-
-        hashtags = set()
-        for tweet in self.tweets:
-            for hashtag in tweet.get("hashtags", []):
-                hashtags.add(hashtag)
-
-        return {
-            "user_count": len(self.users),
-            "tweet_count": len(self.tweets),
-            "distinct_hashtag_count": len(hashtags),
-        }
-
-    def get_top_tweets(self):
-        if self.db is not None:
-            return get_top_tweets(self.db)
-
-        tweets = []
-        for tweet in self._sort_by_created_at(self.tweets, reverse=True):
-            tweets.append(self._attach_username(tweet))
-        tweets = sorted(tweets, key=lambda item: (-item.get("favorite_count", 0), item.get("tweet_id", "")))
-        return tweets[:10]
-
-    def get_top_hashtags(self):
-        if self.db is not None:
-            return get_top_hashtags(self.db)
-
-        counts = {}
-        for tweet in self.tweets:
-            for hashtag in tweet.get("hashtags", []):
-                counts[hashtag] = counts.get(hashtag, 0) + 1
-
-        rows = []
-        for hashtag, total in counts.items():
-            rows.append({"hashtag": hashtag, "tweet_count": total})
-        return sorted(rows, key=lambda item: (-item["tweet_count"], item["hashtag"]))[:10]
-
-    def get_activity_series(self, limit=7):
-        if self.db is not None:
-            rows = list(
-                self.db.tweets.aggregate(
-                    [
-                        {"$group": {"_id": {"$substr": ["$created_at", 0, 10]}, "tweet_count": {"$sum": 1}}},
-                        {"$sort": {"_id": 1}},
-                    ]
-                )
-            )
-            rows = [{"day": row["_id"], "tweet_count": row["tweet_count"]} for row in rows]
-        else:
-            counts = defaultdict(int)
-            for tweet in self.tweets:
-                counts[tweet.get("created_at", "")[:10]] += 1
-            rows = [{"day": day, "tweet_count": count} for day, count in sorted(counts.items())]
-
-        return rows[-limit:]
-
-    def get_featured_users(self, limit=4):
-        if self.db is not None:
-            rows = list(
-                self.db.tweets.aggregate(
-                    [
-                        {
-                            "$group": {
-                                "_id": "$user_id",
-                                "tweet_count": {"$sum": 1},
-                                "favorite_total": {"$sum": "$favorite_count"},
-                            }
-                        },
-                        {"$sort": {"tweet_count": -1, "favorite_total": -1, "_id": 1}},
-                        {"$limit": limit},
-                        {
-                            "$lookup": {
-                                "from": "users",
-                                "localField": "_id",
-                                "foreignField": "user_id",
-                                "as": "profile",
-                            }
-                        },
-                        {
-                            "$project": {
-                                "_id": 0,
-                                "user_id": "$_id",
-                                "tweet_count": 1,
-                                "favorite_total": 1,
-                                "username": {"$arrayElemAt": ["$profile.username", 0]},
-                                "role": {"$arrayElemAt": ["$profile.role", 0]},
-                                "country": {"$arrayElemAt": ["$profile.country", 0]},
-                            }
-                        },
-                    ]
-                )
-            )
-            return rows
-
-        counts = defaultdict(lambda: {"tweet_count": 0, "favorite_total": 0})
-        for tweet in self.tweets:
-            user_id = tweet.get("user_id")
-            counts[user_id]["tweet_count"] += 1
-            counts[user_id]["favorite_total"] += tweet.get("favorite_count", 0)
-
-        rows = []
-        for user_id, totals in counts.items():
-            profile = self.users_by_id.get(user_id, {})
-            rows.append(
-                {
-                    "user_id": user_id,
-                    "username": profile.get("username", "unknown"),
-                    "role": profile.get("role", PLACEHOLDER),
-                    "country": profile.get("country", PLACEHOLDER),
-                    "tweet_count": totals["tweet_count"],
-                    "favorite_total": totals["favorite_total"],
-                }
-            )
-
-        return sorted(rows, key=lambda item: (-item["tweet_count"], -item["favorite_total"], item["username"]))[:limit]
-
-    def search_users(self, query, limit=12):
-        query = query.strip()
-        if not query:
-            return []
-
-        if self.db is not None:
-            cursor = (
-                self.db.users.find({"username": {"$regex": re.escape(query), "$options": "i"}}, {"_id": 0})
-                .sort("username", 1)
-                .limit(limit)
-            )
-            return [self._clean_doc(row) for row in cursor]
-
-        results = []
-        needle = query.lower()
-        for user in self.users:
-            if needle in user.get("username", "").lower():
-                results.append(dict(user))
-        return sorted(results, key=lambda item: item["username"])[:limit]
-
-    def search_hashtags(self, query, limit=12):
-        query = self._normalize_hashtag(query)
-        if not query:
-            return []
-
-        if self.db is not None:
-            rows = list(
-                self.db.tweets.aggregate(
-                    [
-                        {"$unwind": "$hashtags"},
-                        {"$match": {"hashtags": {"$regex": re.escape(query), "$options": "i"}}},
-                        {"$group": {"_id": "$hashtags", "tweet_count": {"$sum": 1}}},
-                        {"$sort": {"tweet_count": -1, "_id": 1}},
-                        {"$limit": limit},
-                        {"$project": {"_id": 0, "hashtag": "$_id", "tweet_count": 1}},
-                    ]
-                )
-            )
-            return rows
-
-        counts = {}
-        for tweet in self.tweets:
-            for hashtag in tweet.get("hashtags", []):
-                if query in hashtag.lower():
-                    counts[hashtag] = counts.get(hashtag, 0) + 1
-
-        rows = []
-        for hashtag, total in counts.items():
-            rows.append({"hashtag": hashtag, "tweet_count": total})
-        return sorted(rows, key=lambda item: (-item["tweet_count"], item["hashtag"]))[:limit]
-
-    def search_tweets_by_text(self, query, limit=20):
-        query = query.strip()
-        if not query:
-            return []
-
-        if self.db is not None:
-            rows = list(
-                self.db.tweets.aggregate(
-                    [
-                        {"$match": {"text": {"$regex": re.escape(query), "$options": "i"}}},
-                        {"$sort": {"created_at": -1, "tweet_id": 1}},
-                        {"$limit": limit},
-                        {
-                            "$lookup": {
-                                "from": "users",
-                                "localField": "user_id",
-                                "foreignField": "user_id",
-                                "as": "author",
-                            }
-                        },
-                        {
-                            "$project": {
-                                "_id": 0,
-                                "tweet_id": 1,
-                                "user_id": 1,
-                                "text": 1,
-                                "hashtags": 1,
-                                "created_at": 1,
-                                "favorite_count": 1,
-                                "in_reply_to_tweet_id": 1,
-                                "username": {"$arrayElemAt": ["$author.username", 0]},
-                            }
-                        },
-                    ]
-                )
-            )
-            return rows
-
-        needle = query.lower()
-        rows = []
-        for tweet in self.tweets:
-            if needle in tweet.get("text", "").lower():
-                rows.append(self._attach_username(tweet))
-        return self._sort_by_created_at(rows, reverse=True)[:limit]
-
-    def get_user_by_username(self, username):
-        if not username:
-            return None
-
-        if self.db is not None:
-            row = self.db.users.find_one(
-                {"username": {"$regex": f"^{re.escape(username)}$", "$options": "i"}},
-                {"_id": 0},
-            )
-            return self._clean_doc(row)
-
-        return self.users_by_username.get(username.lower())
-
-    def get_user_by_id(self, user_id):
-        if not user_id:
-            return None
-
-        if self.db is not None:
-            row = self.db.users.find_one({"user_id": user_id}, {"_id": 0})
-            return self._clean_doc(row)
-
-        return self.users_by_id.get(user_id)
-
-    def get_tweets_by_user(self, user_id, limit=20):
-        if not user_id:
-            return []
-
-        if self.db is not None:
-            cursor = self.db.tweets.find({"user_id": user_id}, {"_id": 0}).sort("created_at", -1).limit(limit)
-            rows = [self._clean_doc(row) for row in cursor]
-            return [self._attach_username(row) for row in rows]
-
-        rows = [self._attach_username(tweet) for tweet in self.tweets if tweet.get("user_id") == user_id]
-        return self._sort_by_created_at(rows, reverse=True)[:limit]
-
-    def get_hashtag_summary(self, hashtag):
-        normalized = self._normalize_hashtag(hashtag)
-        if not normalized:
-            return None
-
-        if self.db is not None:
-            rows = list(
-                self.db.tweets.aggregate(
-                    [
-                        {"$match": {"hashtags": normalized}},
-                        {
-                            "$group": {
-                                "_id": None,
-                                "tweet_count": {"$sum": 1},
-                                "user_ids": {"$addToSet": "$user_id"},
-                            }
-                        },
-                        {
-                            "$project": {
-                                "_id": 0,
-                                "hashtag": normalized,
-                                "tweet_count": 1,
-                                "user_count": {"$size": "$user_ids"},
-                            }
-                        },
-                    ]
-                )
-            )
-            return rows[0] if rows else None
-
-        matching = [tweet for tweet in self.tweets if normalized in tweet.get("hashtags", [])]
-        if not matching:
-            return None
-
-        user_ids = set()
-        for tweet in matching:
-            user_ids.add(tweet.get("user_id"))
-
-        return {"hashtag": normalized, "tweet_count": len(matching), "user_count": len(user_ids)}
-
-    def get_tweets_by_hashtag(self, hashtag, limit=30):
-        normalized = self._normalize_hashtag(hashtag)
-        if not normalized:
-            return []
-
-        if self.db is not None:
-            rows = list(
-                self.db.tweets.aggregate(
-                    [
-                        {"$match": {"hashtags": normalized}},
-                        {"$sort": {"created_at": -1, "tweet_id": 1}},
-                        {"$limit": limit},
-                        {
-                            "$lookup": {
-                                "from": "users",
-                                "localField": "user_id",
-                                "foreignField": "user_id",
-                                "as": "author",
-                            }
-                        },
-                        {
-                            "$project": {
-                                "_id": 0,
-                                "tweet_id": 1,
-                                "user_id": 1,
-                                "text": 1,
-                                "hashtags": 1,
-                                "created_at": 1,
-                                "favorite_count": 1,
-                                "in_reply_to_tweet_id": 1,
-                                "username": {"$arrayElemAt": ["$author.username", 0]},
-                            }
-                        },
-                    ]
-                )
-            )
-            return rows
-
-        rows = []
-        for tweet in self.tweets:
-            if normalized in tweet.get("hashtags", []):
-                rows.append(self._attach_username(tweet))
-        return self._sort_by_created_at(rows, reverse=True)[:limit]
-
-    def get_tweet_by_id(self, tweet_id):
-        if not tweet_id:
-            return None
-
-        if self.db is not None:
-            row = self.db.tweets.find_one({"tweet_id": tweet_id}, {"_id": 0})
-            return self._attach_username(self._clean_doc(row))
-
-        for tweet in self.tweets:
-            if tweet.get("tweet_id") == tweet_id:
-                return self._attach_username(tweet)
-        return None
-
-    def get_parent_tweet(self, tweet):
-        if not tweet:
-            return None
-        return self.get_tweet_by_id(tweet.get("in_reply_to_tweet_id"))
-
-    def get_conversation_root(self, tweet):
-        current = tweet
-        visited = set()
-        while current and current.get("in_reply_to_tweet_id"):
-            tweet_id = current.get("tweet_id")
-            if tweet_id in visited:
-                break
-            visited.add(tweet_id)
-            parent = self.get_parent_tweet(current)
-            if not parent:
-                break
-            current = parent
-        return current
-
-    def get_replies_for_tweet(self, tweet_id, limit=30):
-        if not tweet_id:
-            return []
-
-        if self.db is not None:
-            rows = list(
-                self.db.tweets.aggregate(
-                    [
-                        {"$match": {"in_reply_to_tweet_id": tweet_id}},
-                        {"$sort": {"created_at": 1, "tweet_id": 1}},
-                        {"$limit": limit},
-                        {
-                            "$lookup": {
-                                "from": "users",
-                                "localField": "user_id",
-                                "foreignField": "user_id",
-                                "as": "author",
-                            }
-                        },
-                        {
-                            "$project": {
-                                "_id": 0,
-                                "tweet_id": 1,
-                                "user_id": 1,
-                                "text": 1,
-                                "hashtags": 1,
-                                "created_at": 1,
-                                "favorite_count": 1,
-                                "in_reply_to_tweet_id": 1,
-                                "username": {"$arrayElemAt": ["$author.username", 0]},
-                            }
-                        },
-                    ]
-                )
-            )
-            return rows
-
-        rows = []
-        for tweet in self.tweets:
-            if tweet.get("in_reply_to_tweet_id") == tweet_id:
-                rows.append(self._attach_username(tweet))
-        return self._sort_by_created_at(rows)[:limit]
-
-    def _normalize_question_result(self, value):
-        if value is None:
-            return PLACEHOLDER
-        if isinstance(value, dict) and not value:
-            return PLACEHOLDER
-        if isinstance(value, list) and not value:
-            return PLACEHOLDER
-        return value
-
-    def _get_conversation_boundaries_json(self):
-        children_by_parent = defaultdict(list)
-        tweets_by_id = {}
-
-        for tweet in self.tweets:
-            tweet_id = tweet.get("tweet_id")
-            if tweet_id:
-                tweets_by_id[tweet_id] = self._attach_username(tweet)
-            parent_id = tweet.get("in_reply_to_tweet_id")
-            if parent_id:
-                children_by_parent[parent_id].append(tweet_id)
-
-        boundaries = []
-        for tweet in self.tweets:
-            if tweet.get("in_reply_to_tweet_id") is not None:
-                continue
-
-            start = self._attach_username(tweet)
-            descendants = []
-            ending_tweets = []
-            max_depth = 0
-            stack = [(tweet.get("tweet_id"), 0)]
-
-            while stack:
-                parent_id, depth = stack.pop()
-                children_ids = children_by_parent.get(parent_id, [])
-                if not children_ids and depth > 0:
-                    leaf = tweets_by_id.get(parent_id)
-                    if leaf:
-                        ending_tweets.append(leaf)
-                for child_id in children_ids:
-                    child = tweets_by_id.get(child_id)
-                    if not child:
-                        continue
-                    descendants.append(child)
-                    child_depth = depth + 1
-                    if child_depth > max_depth:
-                        max_depth = child_depth
-                    stack.append((child_id, child_depth))
-
-            if not descendants:
-                continue
-
-            boundaries.append(
-                {
-                    "conversation_size": 1 + len(descendants),
-                    "longest_reply_chain_length": max_depth + 1,
-                    "start_tweet": {
-                        "tweet_id": start.get("tweet_id"),
-                        "user_id": start.get("user_id"),
-                        "username": start.get("username"),
-                        "created_at": start.get("created_at"),
-                        "text": start.get("text"),
-                        "hashtags": start.get("hashtags", []),
-                        "favorite_count": start.get("favorite_count", 0),
-                        "in_reply_to_tweet_id": start.get("in_reply_to_tweet_id"),
-                    },
-                    "ending_tweets": self._sort_by_created_at(ending_tweets),
-                }
-            )
-
-        return sorted(boundaries, key=lambda item: item["start_tweet"].get("tweet_id", ""))
-
-    def get_extended_conversation(self, tweet_id):
-        tweet = self.get_tweet_by_id(tweet_id)
-        if not tweet:
-            return None
-
-        root = self.get_conversation_root(tweet)
-        if not root:
-            return None
-
-        if self.db is not None:
-            boundaries = get_conversation_boundaries(self.db)
-            longest = get_longest_conversation(self.db)
-            starters = get_thread_starters(self.db)
-
-            selected = None
-            for item in boundaries:
-                start_tweet = item.get("start_tweet", {})
-                if start_tweet.get("tweet_id") == root.get("tweet_id"):
-                    selected = dict(item)
-                    break
-
-            starter = None
-            for item in starters:
-                if item.get("tweet_id") == root.get("tweet_id"):
-                    starter = dict(item)
-                    break
-
-            if selected:
-                selected["start_tweet"] = self._attach_username(selected.get("start_tweet"))
-                selected["ending_tweets"] = [
-                    self._attach_username(ending_tweet) for ending_tweet in selected.get("ending_tweets", [])
-                ]
-            else:
-                selected = {
-                    "conversation_size": 1,
-                    "longest_reply_chain_length": 1,
-                    "start_tweet": self._attach_username(root),
-                    "ending_tweets": [],
-                }
-
-            selected["root_tweet_id"] = root.get("tweet_id")
-            selected["is_longest"] = longest.get("start_tweet_id") == root.get("tweet_id")
-            selected["direct_reply_count"] = starter.get("direct_reply_count", 0) if starter else 0
-            return selected
-
-        boundaries = self._get_conversation_boundaries_json()
-        selected = None
-        for item in boundaries:
-            start_tweet = item.get("start_tweet", {})
-            if start_tweet.get("tweet_id") == root.get("tweet_id"):
-                selected = dict(item)
-                break
-
-        if not selected:
-            selected = {
-                "conversation_size": 1,
-                "longest_reply_chain_length": 1,
-                "start_tweet": self._attach_username(root),
-                "ending_tweets": [],
-            }
-
-        longest_size = 0
-        longest_chain = 0
-        longest_root_id = ""
-        for item in boundaries:
-            size = item.get("conversation_size", 0)
-            chain = item.get("longest_reply_chain_length", 0)
-            if size > longest_size or (size == longest_size and chain > longest_chain):
-                longest_size = size
-                longest_chain = chain
-                longest_root_id = item.get("start_tweet", {}).get("tweet_id", "")
-
-        selected["root_tweet_id"] = root.get("tweet_id")
-        selected["is_longest"] = longest_root_id == root.get("tweet_id")
-        selected["direct_reply_count"] = len(self.get_replies_for_tweet(root.get("tweet_id", ""), limit=500))
-        return selected
-
-    def get_longest_conversation_summary(self):
-        if self.db is not None:
-            row = get_longest_conversation(self.db)
-            if not row:
-                return None
-
-            start_tweet = self.get_tweet_by_id(row.get("start_tweet_id", ""))
-            return {
-                "start_tweet": start_tweet,
-                "conversation_size": row.get("conversation_size", PLACEHOLDER),
-                "longest_reply_chain_length": row.get("longest_reply_chain_length", PLACEHOLDER),
-                "ending_tweet_count": len(row.get("descendant_tweet_ids", [])),
-            }
-
-        boundaries = self._get_conversation_boundaries_json()
-        if not boundaries:
-            return None
-
-        best = None
-        for item in boundaries:
-            if best is None:
-                best = item
-                continue
-            size = item.get("conversation_size", 0)
-            best_size = best.get("conversation_size", 0)
-            chain = item.get("longest_reply_chain_length", 0)
-            best_chain = best.get("longest_reply_chain_length", 0)
-            if size > best_size or (size == best_size and chain > best_chain):
-                best = item
-
-        if not best:
-            return None
-
-        return {
-            "start_tweet": self._attach_username(best.get("start_tweet")),
-            "conversation_size": best.get("conversation_size", PLACEHOLDER),
-            "longest_reply_chain_length": best.get("longest_reply_chain_length", PLACEHOLDER),
-            "ending_tweet_count": len(best.get("ending_tweets", [])),
-        }
-
-    def get_q7_followers(self):
-        if not self.neo4j_driver:
-            return PLACEHOLDER
-        return self._normalize_question_result(get_milanoops_followers(self.neo4j_driver))
-
-    def get_q8_following(self):
-        if not self.neo4j_driver:
-            return PLACEHOLDER
-        return self._normalize_question_result(get_milanoops_following(self.neo4j_driver))
-
-    def get_q9_mutual_connections(self):
-        if not self.neo4j_driver:
-            return PLACEHOLDER
-        return self._normalize_question_result(get_mutual_connections_with_milanoops(self.neo4j_driver))
-
-    def get_q10_users_with_more_than_ten_followers(self):
-        if not self.neo4j_driver:
-            return PLACEHOLDER
-        return self._normalize_question_result(get_users_with_more_than_ten_followers(self.neo4j_driver))
-
-    def get_q11_users_following_more_than_five_users(self):
-        if not self.neo4j_driver:
-            return PLACEHOLDER
-        return self._normalize_question_result(get_users_following_more_than_five_users(self.neo4j_driver))
 
 
 def find_free_port():
@@ -1207,7 +505,7 @@ def render_sidebar(repo, routes, current_route, on_route_change):
     if selected != current_route:
         on_route_change(selected)
     st.sidebar.markdown("---")
-    st.sidebar.caption(f"Source active : {repo.source}")
+    st.sidebar.caption(f"Source active : {get_mongo_source(repo)}")
     st.sidebar.caption("Si une donnee ou une question n'est pas encore finalisee, l'interface affiche `in progress`.")
 
 
@@ -1366,9 +664,9 @@ def render_tweet_card(tweet, placeholder, on_open_profile, on_open_replies, key_
 
 
 def render_home(repo, placeholder, on_open_search, on_open_profile, on_open_hashtag, on_open_replies, on_route_change):
-    kpis = repo.get_kpis()
-    activity = repo.get_activity_series()
-    top_hashtags = repo.get_top_hashtags()[:4]
+    kpis = get_ui_kpis(repo)
+    activity = get_ui_activity_series(repo)
+    top_hashtags = get_ui_top_hashtags(repo)[:4]
 
     st.markdown("<div class='milano-shell'>", unsafe_allow_html=True)
     st.markdown(
@@ -1465,7 +763,7 @@ def render_top10(repo, placeholder, on_open_hashtag, on_open_replies, on_open_pr
     top_mode = st.radio("Classement", ["Tweets", "Hashtags"], horizontal=True)
 
     if top_mode == "Tweets":
-        items = repo.get_top_tweets()
+        items = get_ui_top_tweets(repo)
         render_bar_rows(
             items,
             "tweet_id",
@@ -1485,7 +783,7 @@ def render_top10(repo, placeholder, on_open_hashtag, on_open_replies, on_open_pr
                 key_prefix=f"top-preview-{tweet.get('tweet_id', 'x')}",
             )
     else:
-        items = repo.get_top_hashtags()
+        items = get_ui_top_hashtags(repo)
         render_bar_rows(
             items,
             "hashtag",
@@ -1497,7 +795,7 @@ def render_top10(repo, placeholder, on_open_hashtag, on_open_replies, on_open_pr
 
     st.markdown("<div class='milano-divider'></div>", unsafe_allow_html=True)
     st.markdown("<div class='milano-panel-title'>Discussion la plus longue</div>", unsafe_allow_html=True)
-    conversation = repo.get_longest_conversation_summary()
+    conversation = get_ui_longest_conversation_summary(repo)
     if not conversation:
         render_placeholder(placeholder)
         return
@@ -1544,7 +842,7 @@ def render_search(repo, placeholder, on_open_profile, on_open_hashtag, on_open_r
         return
 
     if mode == "Utilisateur":
-        rows = repo.search_users(query)
+        rows = search_ui_users(repo, query)
         if rows == placeholder:
             render_placeholder(placeholder)
             return
@@ -1561,7 +859,7 @@ def render_search(repo, placeholder, on_open_profile, on_open_hashtag, on_open_r
                 st.rerun()
 
     elif mode == "Hashtag":
-        rows = repo.search_hashtags(query)
+        rows = search_ui_hashtags(repo, query)
         render_bar_rows(
             rows,
             "hashtag",
@@ -1572,7 +870,7 @@ def render_search(repo, placeholder, on_open_profile, on_open_hashtag, on_open_r
         )
 
     else:
-        rows = repo.search_tweets_by_text(query)
+        rows = search_ui_tweets_by_text(repo, query)
         if rows == placeholder:
             render_placeholder(placeholder)
             return
@@ -1594,9 +892,9 @@ def render_profile(repo, placeholder, on_open_profile, on_open_replies, on_route
     render_page_header("Profil utilisateur", "Page detaillee avec tweets recents.")
     selected_user = None
     if st.session_state.selected_username:
-        selected_user = repo.get_user_by_username(st.session_state.selected_username)
+        selected_user = get_ui_user_by_username(repo, st.session_state.selected_username)
     if not selected_user and st.session_state.selected_user_id:
-        selected_user = repo.get_user_by_id(st.session_state.selected_user_id)
+        selected_user = get_ui_user_by_id(repo, st.session_state.selected_user_id)
 
     if not selected_user:
         lookup = st.text_input("Charger un profil", placeholder="username exact")
@@ -1618,7 +916,7 @@ def render_profile(repo, placeholder, on_open_profile, on_open_replies, on_route
         unsafe_allow_html=True,
     )
     st.markdown("<div class='milano-panel-title'>Ses tweets</div>", unsafe_allow_html=True)
-    tweets = repo.get_tweets_by_user(selected_user.get("user_id", ""))
+    tweets = get_ui_tweets_by_user(repo, selected_user.get("user_id", ""))
     if tweets == placeholder:
         render_placeholder(placeholder)
     elif not tweets:
@@ -1637,48 +935,12 @@ def render_profile(repo, placeholder, on_open_profile, on_open_replies, on_route
 def render_hashtag(repo, placeholder, on_open_profile, on_open_replies, on_route_change):
     render_page_nav(on_route_change, "Hashtag")
     render_page_header("Hashtag", "Questions 4 et 5 sur l'activite d'un hashtag.")
-    current_hashtag = st.session_state.selected_hashtag.strip()
-    manual = st.text_input("Hashtag", value=current_hashtag, placeholder="#milano2026")
-    if manual != current_hashtag:
-        st.session_state.selected_hashtag = manual
-
-    if not manual.strip():
-        st.caption("Selectionne un hashtag depuis Recherche ou saisis-en un.")
-        return
-
-    summary = repo.get_hashtag_summary(manual)
-    if not summary:
-        render_placeholder(placeholder)
-        return
-
-    normalized = summary.get("hashtag", manual.strip().lstrip("#"))
-    st.markdown(f"<div class='milano-panel-title'>#{normalized}</div>", unsafe_allow_html=True)
-    metric_cols = st.columns(2)
-    with metric_cols[0]:
-        render_card("Tweets", summary.get("tweet_count", placeholder), "Messages contenant ce hashtag", kind="kpi")
-    with metric_cols[1]:
-        render_card("Utilisateurs", summary.get("user_count", placeholder), "Auteurs distincts", kind="kpi")
-
-    st.markdown("<div class='milano-panel-title'>Tweets associes</div>", unsafe_allow_html=True)
-    tweets = repo.get_tweets_by_hashtag(normalized)
-    if tweets == placeholder:
-        render_placeholder(placeholder)
-    elif not tweets:
-        st.caption("Aucun tweet pour ce hashtag.")
-    else:
-        for tweet in tweets:
-            render_tweet_card(
-                tweet,
-                placeholder,
-                on_open_profile,
-                on_open_replies,
-                key_prefix=f"hashtag-{tweet.get('tweet_id', 'x')}",
-            )
+    render_placeholder(placeholder)
 
 
 def render_replies(repo, placeholder, on_open_profile, on_open_replies, on_route_change):
     render_page_nav(on_route_change, "Reponses")
-    render_page_header("Reponses", "Questions 6, 14, 15 et 16 autour des reponses et conversations.")
+    render_page_header("Reponses", "Questions 14, 15 et 16 autour des conversations.")
     tweet_id = st.session_state.selected_tweet_id
     manual = st.text_input("Tweet ID", value=tweet_id, placeholder="T0001")
     if manual != tweet_id:
@@ -1689,7 +951,7 @@ def render_replies(repo, placeholder, on_open_profile, on_open_replies, on_route
         st.caption("Ouvre un tweet depuis Top 10 ou Recherche.")
         return
 
-    tweet = repo.get_tweet_by_id(tweet_id)
+    tweet = get_ui_tweet_by_id(repo, tweet_id)
     if not tweet:
         render_placeholder(placeholder)
         return
@@ -1704,7 +966,7 @@ def render_replies(repo, placeholder, on_open_profile, on_open_replies, on_route
         show_reply_button=False,
     )
 
-    parent = repo.get_parent_tweet(tweet)
+    parent = get_ui_parent_tweet(repo, tweet)
     st.markdown("<div class='milano-panel-title'>Tweet parent</div>", unsafe_allow_html=True)
     if tweet.get("in_reply_to_tweet_id"):
         if parent:
@@ -1722,7 +984,7 @@ def render_replies(repo, placeholder, on_open_profile, on_open_replies, on_route
         st.caption("Ce tweet est deja le point de depart.")
 
     st.markdown("<div class='milano-panel-title'>Reponses directes</div>", unsafe_allow_html=True)
-    replies = repo.get_replies_for_tweet(tweet.get("tweet_id", ""))
+    replies = get_ui_replies_for_tweet(repo, tweet.get("tweet_id", ""))
     if replies == placeholder:
         render_placeholder(placeholder)
     elif not replies:
@@ -1738,10 +1000,8 @@ def render_replies(repo, placeholder, on_open_profile, on_open_replies, on_route
                 show_reply_button=False,
             )
 
-    st.caption("Question 6 : tweets qui sont des reponses a un autre tweet.")
-
     st.markdown("<div class='milano-panel-title'>Conversation etendue</div>", unsafe_allow_html=True)
-    conversation = repo.get_extended_conversation(tweet.get("tweet_id", ""))
+    conversation = get_ui_extended_conversation(repo, tweet.get("tweet_id", ""))
     if not conversation:
         render_placeholder(placeholder)
         return
@@ -1802,38 +1062,38 @@ def render_replies(repo, placeholder, on_open_profile, on_open_replies, on_route
             )
 
 
-def render_network(repo, placeholder, on_route_change):
+def render_network(graph_context, placeholder, on_route_change):
     render_page_nav(on_route_change, "Reseau")
     render_page_header("Reseau", "Questions 7 a 11 sur les relations de suivi dans Neo4j.")
 
     render_question_block(
         "Q7",
         "Followers de MilanoOps",
-        repo.get_q7_followers(),
+        get_ui_q7_followers(graph_context),
         placeholder,
     )
     render_question_block(
         "Q8",
         "Utilisateurs suivis par MilanoOps",
-        repo.get_q8_following(),
+        get_ui_q8_following(graph_context),
         placeholder,
     )
     render_question_block(
         "Q9",
         "Relations reciproques avec MilanoOps",
-        repo.get_q9_mutual_connections(),
+        get_ui_q9_mutual_connections(graph_context),
         placeholder,
     )
     render_question_block(
         "Q10",
         "Utilisateurs avec plus de 10 followers",
-        repo.get_q10_users_with_more_than_ten_followers(),
+        get_ui_q10_users_with_more_than_ten_followers(graph_context),
         placeholder,
     )
     render_question_block(
         "Q11",
         "Utilisateurs qui suivent plus de 5 utilisateurs",
-        repo.get_q11_users_following_more_than_five_users(),
+        get_ui_q11_users_following_more_than_five_users(graph_context),
         placeholder,
     )
 
@@ -1852,7 +1112,8 @@ def run_streamlit_ui():
     init_state()
     dev_mode = os.getenv("APP_MILANO_UI_MODE") != "desktop"
     apply_styles(dev_mode=dev_mode)
-    repo = MilanoRepository()
+    repo = create_mongo_context(PLACEHOLDER)
+    graph_context = create_neo4j_context(PLACEHOLDER)
 
     try:
         if dev_mode:
@@ -1871,12 +1132,13 @@ def run_streamlit_ui():
         elif route == "Reponses":
             render_replies(repo, PLACEHOLDER, open_profile, open_replies, set_route)
         else:
-            render_network(repo, PLACEHOLDER, set_route)
+            render_network(graph_context, PLACEHOLDER, set_route)
     except Exception:
         st.error("Erreur de chargement de l'interface.")
         st.markdown("...........")
     finally:
-        repo.close()
+        close_mongo_context(repo)
+        close_neo4j_context(graph_context)
 
 
 if __name__ == "__main__":
