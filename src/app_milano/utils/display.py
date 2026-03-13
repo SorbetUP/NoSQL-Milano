@@ -30,6 +30,7 @@ from app_milano.utils.mongo import (
     get_ui_kpis,
     get_ui_longest_conversation_summary,
     get_ui_parent_tweet,
+    get_ui_reply_tweets,
     get_ui_replies_for_tweet,
     get_ui_top_hashtags,
     get_ui_top_tweets,
@@ -940,7 +941,26 @@ def render_hashtag(repo, placeholder, on_open_profile, on_open_replies, on_route
 
 def render_replies(repo, placeholder, on_open_profile, on_open_replies, on_route_change):
     render_page_nav(on_route_change, "Reponses")
-    render_page_header("Reponses", "Questions 14, 15 et 16 autour des conversations.")
+    render_page_header("Reponses", "Question 6 pour la liste globale, puis questions 14, 15 et 16 pour le detail d'une conversation.")
+
+    st.markdown("<div class='milano-panel-title'>Q6 - Tous les tweets qui sont des reponses</div>", unsafe_allow_html=True)
+    reply_tweets = get_ui_reply_tweets(repo)
+    if reply_tweets == placeholder:
+        render_placeholder(placeholder)
+    elif not reply_tweets:
+        st.caption("Aucun tweet-reponse dans le dataset.")
+    else:
+        st.caption("Liste globale des tweets dont `in_reply_to_tweet_id` n'est pas nul.")
+        for reply_tweet in reply_tweets[:20]:
+            render_tweet_card(
+                reply_tweet,
+                placeholder,
+                on_open_profile,
+                on_open_replies,
+                key_prefix=f"reply-list-{reply_tweet.get('tweet_id', 'x')}",
+            )
+
+    st.markdown("<div class='milano-panel-title'>Detail d'une conversation</div>", unsafe_allow_html=True)
     tweet_id = st.session_state.selected_tweet_id
     manual = st.text_input("Tweet ID", value=tweet_id, placeholder="T0001")
     if manual != tweet_id:
@@ -948,7 +968,7 @@ def render_replies(repo, placeholder, on_open_profile, on_open_replies, on_route
         tweet_id = manual
 
     if not tweet_id.strip():
-        st.caption("Ouvre un tweet depuis Top 10 ou Recherche.")
+        st.caption("Ouvre un tweet depuis la liste ci-dessus, Top 10 ou Recherche.")
         return
 
     tweet = get_ui_tweet_by_id(repo, tweet_id)

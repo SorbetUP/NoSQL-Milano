@@ -109,7 +109,35 @@ def count_users_who_tweeted_hashtag(db: Database, hashtag: str) -> int:
 
 # Question 6: tweets qui sont des reponses a un autre tweet
 def get_reply_tweets(db: Database) -> list[dict]:
-    pass
+    return list(
+        db.tweets.aggregate(
+            [
+                {"$match": {"in_reply_to_tweet_id": {"$ne": None}}},
+                {"$sort": {"created_at": -1, "tweet_id": 1}},
+                {
+                    "$lookup": {
+                        "from": "users",
+                        "localField": "user_id",
+                        "foreignField": "user_id",
+                        "as": "author",
+                    }
+                },
+                {
+                    "$project": {
+                        "_id": 0,
+                        "tweet_id": 1,
+                        "user_id": 1,
+                        "text": 1,
+                        "hashtags": 1,
+                        "created_at": 1,
+                        "favorite_count": 1,
+                        "in_reply_to_tweet_id": 1,
+                        "username": {"$arrayElemAt": ["$author.username", 0]},
+                    }
+                },
+            ]
+        )
+    )
 
 # Question 12: top 10 tweets les plus populaires
 def get_top_tweets(db: Database) -> list[dict]:
@@ -729,6 +757,23 @@ def get_ui_parent_tweet(context, tweet):
     if not tweet:
         return None
     return get_ui_tweet_by_id(context, tweet.get("in_reply_to_tweet_id"))
+
+
+def get_ui_reply_tweets(context, limit=60):
+    if context["db"] is not None:
+        rows = get_reply_tweets(context["db"])
+        if limit:
+            return rows[:limit]
+        return rows
+
+    rows = []
+    for tweet in context["tweets"]:
+        if tweet.get("in_reply_to_tweet_id") is not None:
+            rows.append(_attach_username(context, tweet))
+    rows = _sort_by_created_at(rows, reverse=True)
+    if limit:
+        return rows[:limit]
+    return rows
 
 
 def get_ui_replies_for_tweet(context, tweet_id, limit=30):
