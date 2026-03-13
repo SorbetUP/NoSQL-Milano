@@ -10,30 +10,43 @@ import urllib.request
 from collections import defaultdict
 from pathlib import Path
 
-import streamlit as st
-import webview
-from pymongo import MongoClient
-from streamlit.runtime.scriptrunner_utils.script_run_context import get_script_run_ctx
 
-
+CURRENT_DIR = Path(__file__).resolve().parent
 SRC_DIR = Path(__file__).resolve().parents[2]
 ROOT = SRC_DIR.parent
 
+sys.path = [path for path in sys.path if path not in ("", str(CURRENT_DIR))]
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
+
+import streamlit as st
+import webview
+from neo4j import GraphDatabase
+from pymongo import MongoClient
+from streamlit.runtime.scriptrunner_utils.script_run_context import get_script_run_ctx
 
 from app_milano.config import DATA_DIR, Settings, load_env_file, load_settings
 from app_milano.utils.mongo import (
     count_distinct_hashtags,
     count_tweets,
     count_users,
+    get_conversation_boundaries,
+    get_longest_conversation,
     get_top_hashtags,
     get_top_tweets,
+    get_thread_starters,
+)
+from app_milano.utils.neo4j import (
+    get_milanoops_followers,
+    get_milanoops_following,
+    get_mutual_connections_with_milanoops,
+    get_users_following_more_than_five_users,
+    get_users_with_more_than_ten_followers,
 )
 
 
 PLACEHOLDER = "in progress"
-ROUTES = ["Accueil", "Top 10", "Recherche", "Profil", "Hashtag", "Reponses"]
+ROUTES = ["Accueil", "Top 10", "Recherche", "Profil", "Hashtag", "Reponses", "Reseau"]
 
 
 def print_connection_info(settings: Settings) -> None:
@@ -118,11 +131,13 @@ class MilanoRepository:
         self.source = "JSON local"
         self.client = None
         self.db = None
+        self.neo4j_driver = None
         self.settings = None
         self.users, self.tweets = self._load_dataset()
         self.users_by_id = {user["user_id"]: user for user in self.users}
         self.users_by_username = {user["username"].lower(): user for user in self.users}
         self._connect_mongo()
+        self._connect_neo4j()
 
     def _load_dataset(self):
         users = json.loads((DATA_DIR / "users.json").read_text(encoding="utf-8"))
@@ -147,9 +162,29 @@ class MilanoRepository:
             self.settings = None
             self.source = "JSON local"
 
+    def _connect_neo4j(self):
+        if not load_env_file(required=False):
+            return
+
+        try:
+            if self.settings is None:
+                self.settings = load_settings()
+            self.neo4j_driver = GraphDatabase.driver(
+                self.settings.neo4j_bolt_uri,
+                auth=(self.settings.neo4j_user, self.settings.neo4j_password),
+            )
+            with self.neo4j_driver.session() as session:
+                session.run("RETURN 1").consume()
+        except Exception:
+            if self.neo4j_driver:
+                self.neo4j_driver.close()
+            self.neo4j_driver = None
+
     def close(self):
         if self.client:
             self.client.close()
+        if self.neo4j_driver:
+            self.neo4j_driver.close()
 
     def _clean_doc(self, doc):
         if not doc:
@@ -528,6 +563,20 @@ class MilanoRepository:
             return None
         return self.get_tweet_by_id(tweet.get("in_reply_to_tweet_id"))
 
+    def get_conversation_root(self, tweet):
+        current = tweet
+        visited = set()
+        while current and current.get("in_reply_to_tweet_id"):
+            tweet_id = current.get("tweet_id")
+            if tweet_id in visited:
+                break
+            visited.add(tweet_id)
+            parent = self.get_parent_tweet(current)
+            if not parent:
+                break
+            current = parent
+        return current
+
     def get_replies_for_tweet(self, tweet_id, limit=30):
         if not tweet_id:
             return []
@@ -570,6 +619,220 @@ class MilanoRepository:
             if tweet.get("in_reply_to_tweet_id") == tweet_id:
                 rows.append(self._attach_username(tweet))
         return self._sort_by_created_at(rows)[:limit]
+
+    def _normalize_question_result(self, value):
+        if value is None:
+            return PLACEHOLDER
+        if isinstance(value, dict) and not value:
+            return PLACEHOLDER
+        if isinstance(value, list) and not value:
+            return PLACEHOLDER
+        return value
+
+    def _get_conversation_boundaries_json(self):
+        children_by_parent = defaultdict(list)
+        tweets_by_id = {}
+
+        for tweet in self.tweets:
+            tweet_id = tweet.get("tweet_id")
+            if tweet_id:
+                tweets_by_id[tweet_id] = self._attach_username(tweet)
+            parent_id = tweet.get("in_reply_to_tweet_id")
+            if parent_id:
+                children_by_parent[parent_id].append(tweet_id)
+
+        boundaries = []
+        for tweet in self.tweets:
+            if tweet.get("in_reply_to_tweet_id") is not None:
+                continue
+
+            start = self._attach_username(tweet)
+            descendants = []
+            ending_tweets = []
+            max_depth = 0
+            stack = [(tweet.get("tweet_id"), 0)]
+
+            while stack:
+                parent_id, depth = stack.pop()
+                children_ids = children_by_parent.get(parent_id, [])
+                if not children_ids and depth > 0:
+                    leaf = tweets_by_id.get(parent_id)
+                    if leaf:
+                        ending_tweets.append(leaf)
+                for child_id in children_ids:
+                    child = tweets_by_id.get(child_id)
+                    if not child:
+                        continue
+                    descendants.append(child)
+                    child_depth = depth + 1
+                    if child_depth > max_depth:
+                        max_depth = child_depth
+                    stack.append((child_id, child_depth))
+
+            if not descendants:
+                continue
+
+            boundaries.append(
+                {
+                    "conversation_size": 1 + len(descendants),
+                    "longest_reply_chain_length": max_depth + 1,
+                    "start_tweet": {
+                        "tweet_id": start.get("tweet_id"),
+                        "user_id": start.get("user_id"),
+                        "username": start.get("username"),
+                        "created_at": start.get("created_at"),
+                        "text": start.get("text"),
+                        "hashtags": start.get("hashtags", []),
+                        "favorite_count": start.get("favorite_count", 0),
+                        "in_reply_to_tweet_id": start.get("in_reply_to_tweet_id"),
+                    },
+                    "ending_tweets": self._sort_by_created_at(ending_tweets),
+                }
+            )
+
+        return sorted(boundaries, key=lambda item: item["start_tweet"].get("tweet_id", ""))
+
+    def get_extended_conversation(self, tweet_id):
+        tweet = self.get_tweet_by_id(tweet_id)
+        if not tweet:
+            return None
+
+        root = self.get_conversation_root(tweet)
+        if not root:
+            return None
+
+        if self.db is not None:
+            boundaries = get_conversation_boundaries(self.db)
+            longest = get_longest_conversation(self.db)
+            starters = get_thread_starters(self.db)
+
+            selected = None
+            for item in boundaries:
+                start_tweet = item.get("start_tweet", {})
+                if start_tweet.get("tweet_id") == root.get("tweet_id"):
+                    selected = dict(item)
+                    break
+
+            starter = None
+            for item in starters:
+                if item.get("tweet_id") == root.get("tweet_id"):
+                    starter = dict(item)
+                    break
+
+            if selected:
+                selected["start_tweet"] = self._attach_username(selected.get("start_tweet"))
+                selected["ending_tweets"] = [
+                    self._attach_username(ending_tweet) for ending_tweet in selected.get("ending_tweets", [])
+                ]
+            else:
+                selected = {
+                    "conversation_size": 1,
+                    "longest_reply_chain_length": 1,
+                    "start_tweet": self._attach_username(root),
+                    "ending_tweets": [],
+                }
+
+            selected["root_tweet_id"] = root.get("tweet_id")
+            selected["is_longest"] = longest.get("start_tweet_id") == root.get("tweet_id")
+            selected["direct_reply_count"] = starter.get("direct_reply_count", 0) if starter else 0
+            return selected
+
+        boundaries = self._get_conversation_boundaries_json()
+        selected = None
+        for item in boundaries:
+            start_tweet = item.get("start_tweet", {})
+            if start_tweet.get("tweet_id") == root.get("tweet_id"):
+                selected = dict(item)
+                break
+
+        if not selected:
+            selected = {
+                "conversation_size": 1,
+                "longest_reply_chain_length": 1,
+                "start_tweet": self._attach_username(root),
+                "ending_tweets": [],
+            }
+
+        longest_size = 0
+        longest_chain = 0
+        longest_root_id = ""
+        for item in boundaries:
+            size = item.get("conversation_size", 0)
+            chain = item.get("longest_reply_chain_length", 0)
+            if size > longest_size or (size == longest_size and chain > longest_chain):
+                longest_size = size
+                longest_chain = chain
+                longest_root_id = item.get("start_tweet", {}).get("tweet_id", "")
+
+        selected["root_tweet_id"] = root.get("tweet_id")
+        selected["is_longest"] = longest_root_id == root.get("tweet_id")
+        selected["direct_reply_count"] = len(self.get_replies_for_tweet(root.get("tweet_id", ""), limit=500))
+        return selected
+
+    def get_longest_conversation_summary(self):
+        if self.db is not None:
+            row = get_longest_conversation(self.db)
+            if not row:
+                return None
+
+            start_tweet = self.get_tweet_by_id(row.get("start_tweet_id", ""))
+            return {
+                "start_tweet": start_tweet,
+                "conversation_size": row.get("conversation_size", PLACEHOLDER),
+                "longest_reply_chain_length": row.get("longest_reply_chain_length", PLACEHOLDER),
+                "ending_tweet_count": len(row.get("descendant_tweet_ids", [])),
+            }
+
+        boundaries = self._get_conversation_boundaries_json()
+        if not boundaries:
+            return None
+
+        best = None
+        for item in boundaries:
+            if best is None:
+                best = item
+                continue
+            size = item.get("conversation_size", 0)
+            best_size = best.get("conversation_size", 0)
+            chain = item.get("longest_reply_chain_length", 0)
+            best_chain = best.get("longest_reply_chain_length", 0)
+            if size > best_size or (size == best_size and chain > best_chain):
+                best = item
+
+        if not best:
+            return None
+
+        return {
+            "start_tweet": self._attach_username(best.get("start_tweet")),
+            "conversation_size": best.get("conversation_size", PLACEHOLDER),
+            "longest_reply_chain_length": best.get("longest_reply_chain_length", PLACEHOLDER),
+            "ending_tweet_count": len(best.get("ending_tweets", [])),
+        }
+
+    def get_q7_followers(self):
+        if not self.neo4j_driver:
+            return PLACEHOLDER
+        return self._normalize_question_result(get_milanoops_followers(self.neo4j_driver))
+
+    def get_q8_following(self):
+        if not self.neo4j_driver:
+            return PLACEHOLDER
+        return self._normalize_question_result(get_milanoops_following(self.neo4j_driver))
+
+    def get_q9_mutual_connections(self):
+        if not self.neo4j_driver:
+            return PLACEHOLDER
+        return self._normalize_question_result(get_mutual_connections_with_milanoops(self.neo4j_driver))
+
+    def get_q10_users_with_more_than_ten_followers(self):
+        if not self.neo4j_driver:
+            return PLACEHOLDER
+        return self._normalize_question_result(get_users_with_more_than_ten_followers(self.neo4j_driver))
+
+    def get_q11_users_following_more_than_five_users(self):
+        if not self.neo4j_driver:
+            return PLACEHOLDER
+        return self._normalize_question_result(get_users_following_more_than_five_users(self.neo4j_driver))
 
 
 def find_free_port():
@@ -950,8 +1213,8 @@ def render_sidebar(repo, routes, current_route, on_route_change):
 
 def render_page_nav(on_route_change, current_route):
     st.markdown("<div class='milano-nav-wrap'>", unsafe_allow_html=True)
-    nav_cols = st.columns([0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 2.2])
-    labels = ["Accueil", "Top 10", "Recherche", "Profil", "Hashtag", "Reponses"]
+    nav_cols = st.columns([0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 1.4])
+    labels = ["Accueil", "Top 10", "Recherche", "Profil", "Hashtag", "Reponses", "Reseau"]
     for index, label in enumerate(labels):
         button_label = label
         if label == current_route:
@@ -997,6 +1260,43 @@ def render_card(title, value, note="", kind=""):
         """,
         unsafe_allow_html=True,
     )
+
+
+def render_question_block(question_label, title, result, placeholder):
+    st.markdown(f"<div class='milano-panel-title'>{question_label} - {title}</div>", unsafe_allow_html=True)
+
+    if result == placeholder:
+        render_placeholder(placeholder)
+        return
+
+    if isinstance(result, dict):
+        for key, value in result.items():
+            if isinstance(value, list):
+                st.markdown(f"**{key}**")
+                if not value:
+                    render_placeholder(placeholder)
+                else:
+                    for item in value[:10]:
+                        st.markdown(f"- `{item}`")
+            else:
+                st.markdown(f"**{key}** : {value}")
+        return
+
+    if isinstance(result, list):
+        if not result:
+            render_placeholder(placeholder)
+            return
+        for item in result[:10]:
+            if isinstance(item, dict):
+                fragments = []
+                for key, value in item.items():
+                    fragments.append(f"{key}: {value}")
+                st.markdown(f"- {' | '.join(fragments)}")
+            else:
+                st.markdown(f"- {item}")
+        return
+
+    st.markdown(str(result))
 
 
 def render_bar_rows(items, label_key, value_key, placeholder, on_click=None, key_prefix="bar"):
@@ -1093,11 +1393,12 @@ def render_home(repo, placeholder, on_open_search, on_open_profile, on_open_hash
     left_col, right_col = st.columns([1.35, 1], gap="large")
 
     with left_col:
+        st.markdown("<div class='milano-panel-title'>Questions 1 a 3</div>", unsafe_allow_html=True)
         metric_rows = [st.columns(2, gap="medium"), st.columns(2, gap="medium")]
         metric_data = [
-            ("Profils", kpis.get("user_count", placeholder), "comptes suivis", "aqua", "◉"),
-            ("Hashtags", kpis.get("distinct_hashtag_count", placeholder), "balises distinctes", "mint", "⌗"),
-            ("Tweets", kpis.get("tweet_count", placeholder), "messages indexes", "violet", "✦"),
+            ("Q1 Profils", kpis.get("user_count", placeholder), "nombre total d'utilisateurs", "aqua", "◉"),
+            ("Q3 Hashtags", kpis.get("distinct_hashtag_count", placeholder), "hashtags distincts", "mint", "⌗"),
+            ("Q2 Tweets", kpis.get("tweet_count", placeholder), "nombre total de tweets", "violet", "✦"),
             ("Acces", "5", "vues directes disponibles", "indigo", "➜"),
         ]
         for row_index, row in enumerate(metric_rows):
@@ -1160,7 +1461,7 @@ def render_home(repo, placeholder, on_open_search, on_open_profile, on_open_hash
 
 def render_top10(repo, placeholder, on_open_hashtag, on_open_replies, on_open_profile, on_route_change):
     render_page_nav(on_route_change, "Top 10")
-    render_page_header("Top 10", "Grand panneau central pour les classements principaux.")
+    render_page_header("Top 10", "Questions 12 et 13, plus un resume visuel pour la question 15.")
     top_mode = st.radio("Classement", ["Tweets", "Hashtags"], horizontal=True)
 
     if top_mode == "Tweets":
@@ -1192,6 +1493,36 @@ def render_top10(repo, placeholder, on_open_hashtag, on_open_replies, on_open_pr
             placeholder,
             key_prefix="top-hashtags",
             on_click=lambda item: on_open_hashtag(item.get("hashtag", "")),
+        )
+
+    st.markdown("<div class='milano-divider'></div>", unsafe_allow_html=True)
+    st.markdown("<div class='milano-panel-title'>Discussion la plus longue</div>", unsafe_allow_html=True)
+    conversation = repo.get_longest_conversation_summary()
+    if not conversation:
+        render_placeholder(placeholder)
+        return
+
+    info_cols = st.columns(3)
+    with info_cols[0]:
+        render_card("Taille", conversation.get("conversation_size", placeholder), "tweets", kind="kpi")
+    with info_cols[1]:
+        render_card(
+            "Chaine max",
+            conversation.get("longest_reply_chain_length", placeholder),
+            "profondeur de reponses",
+            kind="kpi",
+        )
+    with info_cols[2]:
+        render_card("Fins", conversation.get("ending_tweet_count", placeholder), "branches terminales", kind="kpi")
+
+    start_tweet = conversation.get("start_tweet")
+    if start_tweet:
+        render_tweet_card(
+            start_tweet,
+            placeholder,
+            on_open_profile,
+            on_open_replies,
+            key_prefix="top-longest-conversation",
         )
 
 
@@ -1260,7 +1591,7 @@ def render_search(repo, placeholder, on_open_profile, on_open_hashtag, on_open_r
 
 def render_profile(repo, placeholder, on_open_profile, on_open_replies, on_route_change):
     render_page_nav(on_route_change, "Profil")
-    render_page_header("Profil utilisateur", "Page detaillee avec tweets recents et bloc media.")
+    render_page_header("Profil utilisateur", "Page detaillee avec tweets recents.")
     selected_user = None
     if st.session_state.selected_username:
         selected_user = repo.get_user_by_username(st.session_state.selected_username)
@@ -1275,42 +1606,37 @@ def render_profile(repo, placeholder, on_open_profile, on_open_replies, on_route
         st.caption("Selectionne un utilisateur depuis Recherche ou saisis un username exact.")
         return
 
-    left, right = st.columns([2.3, 1])
-    with left:
-        st.markdown(
-            f"""
-            <div class="milano-card">
-                <div class="milano-eyebrow">Profil</div>
-                <div class="milano-panel-title">@{selected_user.get('username', placeholder)}</div>
-                <div class="milano-meta">{selected_user.get('role', placeholder)} • {selected_user.get('country', placeholder)}</div>
-                <div class="milano-muted">Creation : {selected_user.get('created_at', placeholder)}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.markdown("<div class='milano-panel-title'>Ses tweets</div>", unsafe_allow_html=True)
-        tweets = repo.get_tweets_by_user(selected_user.get("user_id", ""))
-        if tweets == placeholder:
-            render_placeholder(placeholder)
-        elif not tweets:
-            st.caption("Aucun tweet pour ce profil.")
-        else:
-            for tweet in tweets[:12]:
-                render_tweet_card(
-                    tweet,
-                    placeholder,
-                    on_open_profile,
-                    on_open_replies,
-                    key_prefix=f"profile-{tweet.get('tweet_id', 'x')}",
-                )
-    with right:
-        st.markdown("<div class='milano-panel-title'>Media</div>", unsafe_allow_html=True)
+    st.markdown(
+        f"""
+        <div class="milano-card">
+            <div class="milano-eyebrow">Profil</div>
+            <div class="milano-panel-title">@{selected_user.get('username', placeholder)}</div>
+            <div class="milano-meta">{selected_user.get('role', placeholder)} • {selected_user.get('country', placeholder)}</div>
+            <div class="milano-muted">Creation : {selected_user.get('created_at', placeholder)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown("<div class='milano-panel-title'>Ses tweets</div>", unsafe_allow_html=True)
+    tweets = repo.get_tweets_by_user(selected_user.get("user_id", ""))
+    if tweets == placeholder:
         render_placeholder(placeholder)
+    elif not tweets:
+        st.caption("Aucun tweet pour ce profil.")
+    else:
+        for tweet in tweets[:12]:
+            render_tweet_card(
+                tweet,
+                placeholder,
+                on_open_profile,
+                on_open_replies,
+                key_prefix=f"profile-{tweet.get('tweet_id', 'x')}",
+            )
 
 
 def render_hashtag(repo, placeholder, on_open_profile, on_open_replies, on_route_change):
     render_page_nav(on_route_change, "Hashtag")
-    render_page_header("Hashtag", "Liste des posts avec resume d'activite par hashtag.")
+    render_page_header("Hashtag", "Questions 4 et 5 sur l'activite d'un hashtag.")
     current_hashtag = st.session_state.selected_hashtag.strip()
     manual = st.text_input("Hashtag", value=current_hashtag, placeholder="#milano2026")
     if manual != current_hashtag:
@@ -1352,7 +1678,7 @@ def render_hashtag(repo, placeholder, on_open_profile, on_open_replies, on_route
 
 def render_replies(repo, placeholder, on_open_profile, on_open_replies, on_route_change):
     render_page_nav(on_route_change, "Reponses")
-    render_page_header("Reponses", "Vue detail d'un tweet et de ses reponses directes.")
+    render_page_header("Reponses", "Questions 6, 14, 15 et 16 autour des reponses et conversations.")
     tweet_id = st.session_state.selected_tweet_id
     manual = st.text_input("Tweet ID", value=tweet_id, placeholder="T0001")
     if manual != tweet_id:
@@ -1412,8 +1738,104 @@ def render_replies(repo, placeholder, on_open_profile, on_open_replies, on_route
                 show_reply_button=False,
             )
 
+    st.caption("Question 6 : tweets qui sont des reponses a un autre tweet.")
+
     st.markdown("<div class='milano-panel-title'>Conversation etendue</div>", unsafe_allow_html=True)
-    render_placeholder(placeholder)
+    conversation = repo.get_extended_conversation(tweet.get("tweet_id", ""))
+    if not conversation:
+        render_placeholder(placeholder)
+        return
+
+    summary_cols = st.columns(4)
+    with summary_cols[0]:
+        render_card(
+            "Taille",
+            conversation.get("conversation_size", placeholder),
+            "tweets dans la conversation",
+            kind="kpi",
+        )
+    with summary_cols[1]:
+        render_card(
+            "Chaine max",
+            conversation.get("longest_reply_chain_length", placeholder),
+            "longueur maximale de reponses",
+            kind="kpi",
+        )
+    with summary_cols[2]:
+        render_card(
+            "Reponses directes",
+            conversation.get("direct_reply_count", placeholder),
+            "a partir du tweet initial",
+            kind="kpi",
+        )
+    with summary_cols[3]:
+        longest_label = "oui" if conversation.get("is_longest") else "non"
+        render_card("Plus longue", longest_label, "sur l'ensemble du dataset", kind="kpi")
+
+    start_tweet = conversation.get("start_tweet")
+    st.markdown("<div class='milano-panel-title'>Point de depart</div>", unsafe_allow_html=True)
+    if start_tweet:
+        render_tweet_card(
+            start_tweet,
+            placeholder,
+            on_open_profile,
+            on_open_replies,
+            key_prefix=f"reply-root-{start_tweet.get('tweet_id', 'x')}",
+            show_reply_button=False,
+        )
+    else:
+        render_placeholder(placeholder)
+
+    st.markdown("<div class='milano-panel-title'>Fins de conversation</div>", unsafe_allow_html=True)
+    ending_tweets = conversation.get("ending_tweets", [])
+    if not ending_tweets:
+        st.caption("Pas de fin distincte a afficher pour cette conversation.")
+    else:
+        for ending_tweet in ending_tweets:
+            render_tweet_card(
+                ending_tweet,
+                placeholder,
+                on_open_profile,
+                on_open_replies,
+                key_prefix=f"reply-ending-{ending_tweet.get('tweet_id', 'x')}",
+                show_reply_button=False,
+            )
+
+
+def render_network(repo, placeholder, on_route_change):
+    render_page_nav(on_route_change, "Reseau")
+    render_page_header("Reseau", "Questions 7 a 11 sur les relations de suivi dans Neo4j.")
+
+    render_question_block(
+        "Q7",
+        "Followers de MilanoOps",
+        repo.get_q7_followers(),
+        placeholder,
+    )
+    render_question_block(
+        "Q8",
+        "Utilisateurs suivis par MilanoOps",
+        repo.get_q8_following(),
+        placeholder,
+    )
+    render_question_block(
+        "Q9",
+        "Relations reciproques avec MilanoOps",
+        repo.get_q9_mutual_connections(),
+        placeholder,
+    )
+    render_question_block(
+        "Q10",
+        "Utilisateurs avec plus de 10 followers",
+        repo.get_q10_users_with_more_than_ten_followers(),
+        placeholder,
+    )
+    render_question_block(
+        "Q11",
+        "Utilisateurs qui suivent plus de 5 utilisateurs",
+        repo.get_q11_users_following_more_than_five_users(),
+        placeholder,
+    )
 
 
 def run_streamlit_ui():
@@ -1446,8 +1868,10 @@ def run_streamlit_ui():
             render_profile(repo, PLACEHOLDER, open_profile, open_replies, set_route)
         elif route == "Hashtag":
             render_hashtag(repo, PLACEHOLDER, open_profile, open_replies, set_route)
-        else:
+        elif route == "Reponses":
             render_replies(repo, PLACEHOLDER, open_profile, open_replies, set_route)
+        else:
+            render_network(repo, PLACEHOLDER, set_route)
     except Exception:
         st.error("Erreur de chargement de l'interface.")
         st.markdown("...........")
