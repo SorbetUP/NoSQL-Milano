@@ -17,7 +17,7 @@ from .utils.mongo import (
     load_dataset,
     wait_for_mongo,
 )
-from .utils.neo4j import import_graph, wait_for_neo4j
+from .utils.neo4j import import_graph, load_follows, wait_for_neo4j
 
 
 class AppMilano:
@@ -44,14 +44,15 @@ class AppMilano:
             "top_tweets": get_top_tweets(mongo_db),
             "top_hashtags": get_top_hashtags(mongo_db),
         }
-        users, tweets = load_dataset()
+        users, _ = load_dataset()
+        follows = load_follows()
 
         neo4j_driver = wait_for_neo4j(
             self.settings.neo4j_bolt_uri,
             self.settings.neo4j_user,
             self.settings.neo4j_password,
         )
-        import_graph(neo4j_driver, users, tweets)
+        import_graph(neo4j_driver, users, follows)
         neo4j_driver.close()
         mongo_client.close()
 

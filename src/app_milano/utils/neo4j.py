@@ -1,8 +1,9 @@
+import csv
 import time
 
 from neo4j import Driver, GraphDatabase
 
-from app_milano.config import load_env_file, load_settings
+from app_milano.config import DATA_DIR, load_env_file, load_settings
 
 
 def wait_for_neo4j(uri: str, user: str, password: str, timeout: int = 120) -> Driver:
@@ -24,10 +25,17 @@ def batch_rows(rows: list[dict], size: int = 200):
         yield rows[start : start + size]
 
 
-def import_graph(driver: Driver, users: list[dict], tweets: list[dict]) -> None:
+def load_follows() -> list[dict]:
+    follows_path = DATA_DIR / "follows.csv"
+    if not follows_path.exists():
+        return []
+    with follows_path.open(encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def import_graph(driver: Driver, users: list[dict], follows: list[dict]) -> None:
     constraints = [
         "CREATE CONSTRAINT user_user_id IF NOT EXISTS FOR (u:User) REQUIRE u.user_id IS UNIQUE",
-        "CREATE CONSTRAINT tweet_tweet_id IF NOT EXISTS FOR (t:Tweet) REQUIRE t.tweet_id IS UNIQUE",
         "CREATE INDEX user_username IF NOT EXISTS FOR (u:User) ON (u.username)",
     ]
 
@@ -49,62 +57,103 @@ def import_graph(driver: Driver, users: list[dict], tweets: list[dict]) -> None:
                 rows=batch,
             ).consume()
 
-        for batch in batch_rows(tweets):
+        for batch in batch_rows(follows):
             session.run(
                 """
                 UNWIND $rows AS row
-                MERGE (t:Tweet {tweet_id: row.tweet_id})
-                SET t.user_id = row.user_id,
-                    t.text = row.text,
-                    t.hashtags = row.hashtags,
-                    t.created_at = row.created_at,
-                    t.favorite_count = row.favorite_count,
-                    t.in_reply_to_tweet_id = row.in_reply_to_tweet_id
+                MATCH (source:User {user_id: row.source_user_id})
+                MATCH (target:User {user_id: row.target_user_id})
+                WHERE source.user_id <> target.user_id
+                MERGE (source)-[:FOLLOWS]->(target)
                 """,
                 rows=batch,
             ).consume()
 
-        session.run(
-            """
-            MATCH (u:User)
-            MATCH (t:Tweet {user_id: u.user_id})
-            MERGE (u)-[:AUTHORED]->(t)
-            """
-        ).consume()
-
-        session.run(
-            """
-            MATCH (t:Tweet)
-            WHERE t.in_reply_to_tweet_id IS NOT NULL
-            MATCH (parent:Tweet {tweet_id: t.in_reply_to_tweet_id})
-            MERGE (t)-[:REPLY_TO]->(parent)
-            """
-        ).consume()
-
 
 # Question 7: followers de MilanoOps
 def get_milanoops_followers(driver: Driver) -> list[dict]:
-    pass
+    with driver.session() as session:
+        result = session.run(
+            """
+            MATCH (user:User)-[:FOLLOWS]->(:User {username: 'MilanoOps'})
+            RETURN user.user_id AS user_id,
+                   user.username AS username,
+                   user.role AS role,
+                   user.country AS country
+            ORDER BY user.username
+            """
+        )
+        return [record.data() for record in result]
 
 
 # Question 8: utilisateurs suivis par MilanoOps
 def get_milanoops_following(driver: Driver) -> list[dict]:
-    pass
+    with driver.session() as session:
+        result = session.run(
+            """
+            MATCH (:User {username: 'MilanoOps'})-[:FOLLOWS]->(user:User)
+            RETURN user.user_id AS user_id,
+                   user.username AS username,
+                   user.role AS role,
+                   user.country AS country
+            ORDER BY user.username
+            """
+        )
+        return [record.data() for record in result]
 
 
 # Question 9: relations reciproques avec MilanoOps
 def get_mutual_connections_with_milanoops(driver: Driver) -> list[dict]:
-    pass
+    with driver.session() as session:
+        result = session.run(
+            """
+            MATCH (:User {username: 'MilanoOps'})-[:FOLLOWS]->(user:User)-[:FOLLOWS]->(:User {username: 'MilanoOps'})
+            RETURN user.user_id AS user_id,
+                   user.username AS username,
+                   user.role AS role,
+                   user.country AS country
+            ORDER BY user.username
+            """
+        )
+        return [record.data() for record in result]
 
 
 # Question 10: utilisateurs avec plus de 10 followers
 def get_users_with_more_than_ten_followers(driver: Driver) -> list[dict]:
-    pass
+    with driver.session() as session:
+        result = session.run(
+            """
+            MATCH (user:User)<-[:FOLLOWS]-(follower:User)
+            WITH user, count(follower) AS follower_count
+            WHERE follower_count > 10
+            RETURN user.user_id AS user_id,
+                   user.username AS username,
+                   user.role AS role,
+                   user.country AS country,
+                   follower_count
+            ORDER BY follower_count DESC, user.username
+            """
+        )
+        return [record.data() for record in result]
 
 
 # Question 11: utilisateurs qui suivent plus de 5 utilisateurs
 def get_users_following_more_than_five_users(driver: Driver) -> list[dict]:
-    pass
+    with driver.session() as session:
+        result = session.run(
+            """
+            MATCH (user:User)-[:FOLLOWS]->(followed:User)
+            WITH user, count(followed) AS following_count
+            WHERE following_count > 5
+            RETURN user.user_id AS user_id,
+                   user.username AS username,
+                   user.role AS role,
+                   user.country AS country,
+                   following_count
+            ORDER BY following_count DESC, user.username
+            """
+        )
+        return [record.data() for record in result]
 
 
 # Question 14: tweets qui initient une discussion
