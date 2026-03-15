@@ -99,12 +99,29 @@ def count_distinct_hashtags(db: Database) -> int:
 
 # Question 4: nombre de tweets contenant un hashtag donne
 def count_tweets_with_hashtag(db: Database, hashtag: str) -> int:
-    pass
+    result = list(
+        db.tweets.aggregate(
+            [
+                {"$match": {"hashtags": hashtag}},
+                {"$count": "count"},
+            ]
+        )
+    )
+    return result[0]["count"] if result else 0
 
 
 # Question 5: nombre d'utilisateurs distincts ayant tweeté avec un hashtag donne
 def count_users_who_tweeted_hashtag(db: Database, hashtag: str) -> int:
-    pass
+    result = list(
+        db.tweets.aggregate(
+            [
+                {"$match": {"hashtags": hashtag}},
+                {"$group": {"_id": "$user_id"}},
+                {"$count": "count"},
+            ]
+        )
+    )
+    return result[0]["count"] if result else 0
 
 
 # Question 6: tweets qui sont des reponses a un autre tweet

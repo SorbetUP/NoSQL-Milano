@@ -8,7 +8,9 @@ from .utils.display import print_connection_info, print_question_results
 from .utils.docker import require_docker, start_services
 from .utils.mongo import (
     count_distinct_hashtags,
+    count_tweets_with_hashtag,
     count_tweets,
+    count_users_who_tweeted_hashtag,
     count_users,
     get_database,
     get_top_hashtags,
@@ -37,10 +39,14 @@ class AppMilano:
         mongo_client = wait_for_mongo(self.settings.mongo_root_uri)
         import_dataset(mongo_client, self.settings)
         mongo_db = get_database(mongo_client, self.settings)
+        hashtag_spotlight = "milano2026"
         question_results = {
             "user_count": count_users(mongo_db),
             "tweet_count": count_tweets(mongo_db),
             "distinct_hashtag_count": count_distinct_hashtags(mongo_db),
+            "hashtag_spotlight": hashtag_spotlight,
+            "tweets_with_hashtag_count": count_tweets_with_hashtag(mongo_db, hashtag_spotlight),
+            "distinct_users_with_hashtag_count": count_users_who_tweeted_hashtag(mongo_db, hashtag_spotlight),
             "top_tweets": get_top_tweets(mongo_db),
             "top_hashtags": get_top_hashtags(mongo_db),
         }

@@ -28,11 +28,13 @@ from app_milano.utils.mongo import (
     get_mongo_source,
     get_ui_activity_series,
     get_ui_extended_conversation,
+    get_ui_hashtag_summary,
     get_ui_kpis,
     get_ui_longest_conversation_summary,
     get_ui_parent_tweet,
     get_ui_reply_tweets,
     get_ui_replies_for_tweet,
+    get_ui_tweets_by_hashtag,
     get_ui_top_hashtags,
     get_ui_top_tweets,
     get_ui_tweet_by_id,
@@ -77,6 +79,14 @@ def print_question_results(results):
     print(f"Q1 - Nombre d'utilisateurs : {results['user_count']}")
     print(f"Q2 - Nombre de tweets : {results['tweet_count']}")
     print(f"Q3 - Nombre de hashtags distincts : {results['distinct_hashtag_count']}")
+    print(
+        f"Q4 - Nombre de tweets contenant #{results['hashtag_spotlight']} : "
+        f"{results['tweets_with_hashtag_count']}"
+    )
+    print(
+        f"Q5 - Nombre d'utilisateurs distincts ayant tweete avec #{results['hashtag_spotlight']} : "
+        f"{results['distinct_users_with_hashtag_count']}"
+    )
 
     print()
     print("Q12 - Top 10 tweets les plus populaires")
@@ -1183,9 +1193,69 @@ def render_profile(repo, placeholder):
     render_slide_footer("Profil")
 
 
-def render_hashtag(placeholder):
-    render_slide_header("Hashtag", "Hashtag spotlight", "Espace reserve aux questions 4 et 5. Tant que ce n'est pas branche, la slide reste en attente.")
-    render_placeholder(placeholder)
+def render_hashtag(repo, placeholder):
+    render_slide_header("Hashtag", "Hashtag spotlight", "Questions 4 et 5 sur un hashtag choisi, avec quelques tweets pour contexte.")
+
+    current_hashtag = st.session_state.selected_hashtag or "milano2026"
+    entered_hashtag = st.text_input("Hashtag", value=current_hashtag, placeholder="milano2026")
+    if entered_hashtag != st.session_state.selected_hashtag:
+        st.session_state.selected_hashtag = entered_hashtag
+
+    hashtag = st.session_state.selected_hashtag.strip()
+    if not hashtag:
+        render_placeholder("Renseigne un hashtag")
+        render_slide_footer("Hashtag")
+        return
+
+    summary = get_cached_mongo(
+        repo,
+        "hashtag-summary",
+        lambda: get_ui_hashtag_summary(repo, hashtag),
+        hashtag.lower(),
+    )
+    tweets = get_cached_mongo(
+        repo,
+        "hashtag-tweets",
+        lambda: get_ui_tweets_by_hashtag(repo, hashtag),
+        hashtag.lower(),
+    )
+
+    if not summary:
+        render_placeholder("Hashtag introuvable")
+        render_slide_footer("Hashtag")
+        return
+
+    normalized_hashtag = summary.get("hashtag", hashtag.lstrip("#"))
+    st.markdown(
+        f"""
+        <div class="wrapped-panel">
+            <div class="wrapped-route-label">Hashtag selectionne</div>
+            <div class="wrapped-title" style="font-size:2.3rem; text-transform:none;">#{normalized_hashtag}</div>
+            <div class="wrapped-subtitle">Synthese MongoDB des questions 4 et 5.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    stat_cols = st.columns(2)
+    with stat_cols[0]:
+        render_stat("Tweets", summary.get("tweet_count", placeholder), "Q4")
+    with stat_cols[1]:
+        render_stat("Utilisateurs distincts", summary.get("user_count", placeholder), "Q5")
+
+    st.markdown("<div class='wrapped-section-title'>Apercu des tweets correspondants</div>", unsafe_allow_html=True)
+    if tweets == placeholder or not tweets:
+        render_placeholder(placeholder)
+    else:
+        for tweet in tweets[:5]:
+            render_tweet_card(
+                tweet,
+                placeholder,
+                open_profile,
+                open_replies,
+                key_prefix=f"hashtag-{normalized_hashtag}-{tweet.get('tweet_id', 'x')}",
+            )
+
     render_slide_footer("Hashtag")
 
 
@@ -1316,7 +1386,7 @@ def run_streamlit_ui():
         elif route == "Profil":
             render_profile(repo, PLACEHOLDER)
         elif route == "Hashtag":
-            render_hashtag(PLACEHOLDER)
+            render_hashtag(repo, PLACEHOLDER)
         elif route == "Reponses":
             render_replies(repo, PLACEHOLDER)
         else:
