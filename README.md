@@ -42,7 +42,7 @@ Password: neo4j_password
 - [x] preparer un dataset de travail dans `src/docker/data/users.json` et `src/docker/data/tweets.json`
 - [x] finaliser `src/app_milano/main.py` pour qu'il serve d'entree principale stable du projet
 - [x] relier proprement les parties MongoDB et Neo4j dans une execution unique
-- [x] traiter les questions 1, 2, 3, 12 et 13
+- [x] traiter les questions 12 et 13
 - [ ] verifier les sorties globales de l'application pour l'ensemble des questions
 - [ ] finaliser le `README` avec exemples d'execution et captures
 - [ ] faire les tests finaux et preparer la demo
@@ -53,7 +53,7 @@ Password: neo4j_password
 - [x] creer `src/docker/mongo/import_data.py` pour l'import MongoDB
 - [x] implementer le CRUD MongoDB dans `src/docker/mongo/crudfunc.py`
 - [ ] nettoyer et aligner `src/docker/mongo/import_data.py` et `src/docker/mongo/crudfunc.py` avec `.env` et le reste du projet
-- [ ] traiter les questions 4, 5 et 6
+- [ ] traiter les questions 1, 2, 3, 4, 5 et 6
 - [ ] produire les visualisations MongoDB : KPI, top hashtags, top tweets
 - [ ] rediger dans le rapport : modele MongoDB, CRUD, requetes MongoDB, agregations, visualisations MongoDB
 - [ ] preparer les preuves Scrum cote MongoDB : sprint backlog, daily log, resultats
