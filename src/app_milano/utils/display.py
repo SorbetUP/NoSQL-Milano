@@ -73,35 +73,146 @@ def print_connection_info(settings):
     print(f"Password: {settings.neo4j_password}")
 
 
+def _preview_text(text, limit=90):
+    compact = " ".join((text or "").split())
+    return compact[:limit] + ("..." if len(compact) > limit else "")
+
+
+def _print_user_rows(question_label, title, rows, count_key=None, count_label=None):
+    print()
+    print(f"{question_label} - {title}")
+    if not rows:
+        print("Aucun resultat.")
+        return
+    for index, row in enumerate(rows, start=1):
+        details = [f"@{row.get('username', 'unknown')}"]
+        if row.get("user_id"):
+            details.append(row["user_id"])
+        if row.get("role"):
+            details.append(row["role"])
+        if row.get("country"):
+            details.append(row["country"])
+        if count_key and count_key in row:
+            suffix = f" {count_label}" if count_label else ""
+            details.append(f"{row[count_key]}{suffix}")
+        print(f"{index}. {' | '.join(details)}")
+
+
+def _print_tweet_rows(question_label, title, rows, limit=None):
+    print()
+    print(f"{question_label} - {title}")
+    if not rows:
+        print("Aucun resultat.")
+        return
+
+    displayed = rows if limit is None else rows[:limit]
+    for index, tweet in enumerate(displayed, start=1):
+        username = tweet.get("username", "unknown")
+        preview = _preview_text(tweet.get("text", ""))
+        details = [tweet.get("tweet_id", "?"), f"@{username}"]
+        if "favorite_count" in tweet:
+            details.append(f"{tweet.get('favorite_count', 0)} likes")
+        if tweet.get("in_reply_to_tweet_id"):
+            details.append(f"reply to {tweet['in_reply_to_tweet_id']}")
+        print(f"{index}. {' | '.join(details)} | {preview}")
+
+    if limit is not None and len(rows) > limit:
+        print(f"... {len(rows) - limit} autres")
+
+
+def _print_thread_starters(rows, limit=10):
+    print()
+    print("Q14 - Tweets qui initient une discussion")
+    if not rows:
+        print("Aucun resultat.")
+        return
+    for index, tweet in enumerate(rows[:limit], start=1):
+        preview = _preview_text(tweet.get("text", ""))
+        print(
+            f"{index}. {tweet.get('tweet_id', '?')} | @{tweet.get('user_id', 'unknown')} | "
+            f"{tweet.get('direct_reply_count', 0)} reponses directes | {preview}"
+        )
+    if len(rows) > limit:
+        print(f"... {len(rows) - limit} autres")
+
+
+def _print_longest_conversation(row):
+    print()
+    print("Q15 - Discussion la plus longue")
+    if not row:
+        print("Aucun resultat.")
+        return
+    print(f"Tweet de depart : {row.get('start_tweet_id', 'unknown')}")
+    print(f"Taille totale : {row.get('conversation_size', 0)}")
+    print(f"Longueur de chaine max : {row.get('longest_reply_chain_length', 0)}")
+    if row.get("start_text"):
+        print(f"Texte : {_preview_text(row.get('start_text', ''), limit=120)}")
+
+
+def _print_conversation_boundaries(rows, limit=10):
+    print()
+    print("Q16 - Debut et fin de chaque conversation")
+    if not rows:
+        print("Aucun resultat.")
+        return
+    for index, item in enumerate(rows[:limit], start=1):
+        start = item.get("start_tweet", {})
+        endings = item.get("ending_tweets", [])
+        ending_ids = ", ".join(tweet.get("tweet_id", "?") for tweet in endings) or "aucune fin"
+        print(
+            f"{index}. debut={start.get('tweet_id', '?')} | taille={item.get('conversation_size', 0)} | "
+            f"fins={ending_ids}"
+        )
+    if len(rows) > limit:
+        print(f"... {len(rows) - limit} autres conversations")
+
+
 def print_question_results(results):
     print()
     print("Questions MongoDB")
+    hashtag = results["hashtag_spotlight"]
     print(f"Q1 - Nombre d'utilisateurs : {results['user_count']}")
     print(f"Q2 - Nombre de tweets : {results['tweet_count']}")
     print(f"Q3 - Nombre de hashtags distincts : {results['distinct_hashtag_count']}")
-    print(
-        f"Q4 - Nombre de tweets contenant #{results['hashtag_spotlight']} : "
-        f"{results['tweets_with_hashtag_count']}"
+    print(f"Q4 - Tweets avec #{hashtag} : {results['tweets_with_hashtag_count']}")
+    print(f"Q5 - Utilisateurs distincts pour #{hashtag} : {results['distinct_users_with_hashtag_count']}")
+    _print_tweet_rows("Q6", "Tweets qui sont des reponses a un autre tweet", results["reply_tweets"], limit=10)
+
+    print()
+    print("Questions Neo4j")
+    _print_user_rows("Q7", "Followers de MilanoOps", results["milanoops_followers"])
+    _print_user_rows("Q8", "Utilisateurs suivis par MilanoOps", results["milanoops_following"])
+    _print_user_rows("Q9", "Relations reciproques avec MilanoOps", results["milanoops_mutual_connections"])
+    _print_user_rows(
+        "Q10",
+        "Utilisateurs avec plus de 10 followers",
+        results["users_with_more_than_ten_followers"],
+        count_key="follower_count",
+        count_label="followers",
     )
-    print(
-        f"Q5 - Nombre d'utilisateurs distincts ayant tweete avec #{results['hashtag_spotlight']} : "
-        f"{results['distinct_users_with_hashtag_count']}"
+    _print_user_rows(
+        "Q11",
+        "Utilisateurs qui suivent plus de 5 utilisateurs",
+        results["users_following_more_than_five_users"],
+        count_key="following_count",
+        count_label="comptes suivis",
     )
 
     print()
-    print("Q12 - Top 10 tweets les plus populaires")
-    for index, tweet in enumerate(results["top_tweets"], start=1):
-        text = " ".join(tweet["text"].split())
-        preview = text[:90] + ("..." if len(text) > 90 else "")
-        print(
-            f"{index}. {tweet['tweet_id']} | @{tweet.get('username', 'unknown')} | "
-            f"{tweet['favorite_count']} likes | {preview}"
-        )
+    print("Questions MongoDB (suite)")
+    _print_tweet_rows("Q12", "Top 10 tweets les plus populaires", results["top_tweets"])
 
     print()
     print("Q13 - Top 10 hashtags les plus populaires")
-    for index, hashtag in enumerate(results["top_hashtags"], start=1):
-        print(f"{index}. #{hashtag['hashtag']} | {hashtag['tweet_count']} tweets")
+    if not results["top_hashtags"]:
+        print("Aucun resultat.")
+    else:
+        for index, hashtag in enumerate(results["top_hashtags"], start=1):
+            print(f"{index}. #{hashtag['hashtag']} | {hashtag['tweet_count']} tweets")
+
+    _print_thread_starters(results["thread_starters"])
+    _print_longest_conversation(results["longest_conversation"])
+    _print_conversation_boundaries(results["conversation_boundaries"])
 
 
 def init_state():
