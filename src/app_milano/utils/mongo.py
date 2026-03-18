@@ -459,7 +459,7 @@ def _get_conversation_boundaries_json(context):
     return sorted(boundaries, key=lambda item: item["start_tweet"].get("tweet_id", ""))
 
 
-def create_mongo_context(placeholder="in progress"):
+def create_mongo_context(placeholder="Indisponible"):
     users, tweets = load_dataset()
     context = {
         "placeholder": placeholder,

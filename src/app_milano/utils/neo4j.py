@@ -1,4 +1,5 @@
 import csv
+import json
 import time
 
 from neo4j import Driver, GraphDatabase
@@ -31,6 +32,13 @@ def load_follows() -> list[dict]:
         return []
     with follows_path.open(encoding="utf-8", newline="") as handle:
         return list(csv.DictReader(handle))
+
+
+def load_users() -> list[dict]:
+    users_path = DATA_DIR / "users.json"
+    if not users_path.exists():
+        return []
+    return json.loads(users_path.read_text(encoding="utf-8"))
 
 
 def import_graph(driver: Driver, users: list[dict], follows: list[dict]) -> None:
@@ -171,7 +179,7 @@ def get_conversation_start_and_end(driver: Driver) -> list[dict]:
     pass
 
 
-def create_neo4j_context(placeholder="in progress"):
+def create_neo4j_context(placeholder="Indisponible"):
     context = {
         "placeholder": placeholder,
         "settings": None,
@@ -188,6 +196,10 @@ def create_neo4j_context(placeholder="in progress"):
         )
         with context["driver"].session() as session:
             session.run("RETURN 1").consume()
+            user_count = session.run("MATCH (u:User) RETURN count(u) AS value").single()["value"]
+            follows_count = session.run("MATCH ()-[r:FOLLOWS]->() RETURN count(r) AS value").single()["value"]
+        if user_count == 0 or follows_count == 0:
+            import_graph(context["driver"], load_users(), load_follows())
     except Exception:
         if context["driver"]:
             context["driver"].close()

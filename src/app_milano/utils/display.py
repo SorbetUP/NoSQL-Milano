@@ -17,6 +17,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 import streamlit as st
+import streamlit.components.v1 as components
 import webview
 from streamlit.runtime.scriptrunner_utils.script_run_context import get_script_run_ctx
 
@@ -56,7 +57,7 @@ from app_milano.utils.neo4j import (
 )
 
 
-PLACEHOLDER = "in progress"
+PLACEHOLDER = "Indisponible"
 ROUTES = ["Accueil", "Top 10", "Recherche", "Profil", "Hashtag", "Reponses", "Reseau"]
 
 
@@ -856,7 +857,7 @@ def render_dev_sidebar(repo):
     if st.sidebar.button("Refresh data", use_container_width=True):
         reset_ui_backends()
         st.rerun()
-    st.sidebar.caption("Les zones non branchees affichent `in progress`.")
+    st.sidebar.caption("Les zones non disponibles affichent `Indisponible`.")
 
 
 def render_edge_navigation():
@@ -867,6 +868,55 @@ def render_edge_navigation():
     if st.button(" ", key="edge-right-nav", disabled=current_index == len(ROUTES) - 1):
         move_route(1)
         st.rerun()
+
+
+def render_keyboard_navigation():
+    components.html(
+        """
+        <script>
+        (() => {
+            const parentWindow = window.parent;
+            const doc = parentWindow.document;
+            if (!doc || parentWindow.__milanoKeyboardNavigationBound) {
+                return;
+            }
+
+            const isEditableElement = (element) => {
+                if (!element) {
+                    return false;
+                }
+                const tag = (element.tagName || "").toUpperCase();
+                return tag === "INPUT" || tag === "TEXTAREA" || element.isContentEditable;
+            };
+
+            const clickIfAvailable = (selector) => {
+                const button = doc.querySelector(selector);
+                if (button && !button.disabled) {
+                    button.click();
+                }
+            };
+
+            const onKeyDown = (event) => {
+                if (isEditableElement(doc.activeElement)) {
+                    return;
+                }
+                if (event.key === "ArrowRight") {
+                    event.preventDefault();
+                    clickIfAvailable(".st-key-edge-right-nav button");
+                } else if (event.key === "ArrowLeft") {
+                    event.preventDefault();
+                    clickIfAvailable(".st-key-edge-left-nav button");
+                }
+            };
+
+            doc.addEventListener("keydown", onKeyDown, true);
+            parentWindow.__milanoKeyboardNavigationBound = true;
+        })();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
 
 
 def render_progress(current_route):
@@ -1016,6 +1066,33 @@ def render_question_block(question_label, title, result, placeholder):
     st.markdown(f"<div class='wrapped-panel'>{result}</div>", unsafe_allow_html=True)
 
 
+def render_user_result_cards(title, rows, placeholder, count_key=None, count_label=None):
+    st.markdown(f"<div class='wrapped-section-title'>{title}</div>", unsafe_allow_html=True)
+    if rows == placeholder or not rows:
+        render_placeholder(placeholder)
+        return
+
+    for row in rows[:6]:
+        details = []
+        if row.get("role"):
+            details.append(row["role"])
+        if row.get("country"):
+            details.append(row["country"])
+        if count_key and row.get(count_key) is not None:
+            suffix = f" {count_label}" if count_label else ""
+            details.append(f"{row[count_key]}{suffix}")
+
+        st.markdown(
+            f"""
+            <div class="wrapped-panel">
+                <strong>@{row.get('username', placeholder)}</strong><br>
+                {' · '.join(details)}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
 def render_dark_activity_chart(activity_rows):
     values = []
     for index, row in enumerate(activity_rows):
@@ -1106,11 +1183,11 @@ def render_home(repo, placeholder):
 
     stat_cols = st.columns(3)
     with stat_cols[0]:
-        render_stat("Utilisateurs", kpis.get("user_count", placeholder), "Q1")
+        render_stat("Comptes actifs", kpis.get("user_count", placeholder), "profils suivis")
     with stat_cols[1]:
-        render_stat("Tweets", kpis.get("tweet_count", placeholder), "Q2")
+        render_stat("Messages", kpis.get("tweet_count", placeholder), "posts publies")
     with stat_cols[2]:
-        render_stat("Hashtags", kpis.get("distinct_hashtag_count", placeholder), "Q3")
+        render_stat("Hashtags", kpis.get("distinct_hashtag_count", placeholder), "themes suivis")
 
     st.markdown("<div class='wrapped-divider'></div>", unsafe_allow_html=True)
     grid_cols = st.columns(2)
@@ -1145,7 +1222,7 @@ def render_home(repo, placeholder):
 
 
 def render_top10(repo, placeholder):
-    render_slide_header("Top 10", "Top content", "Les tweets et hashtags les plus marquants du dataset.")
+    render_slide_header("Top 10", "Temps forts", "Les publications et hashtags qui ont le plus marque la conversation.")
 
     mode = st.radio("Classement", ["Tweets", "Hashtags"], horizontal=True)
 
@@ -1176,27 +1253,30 @@ def render_top10(repo, placeholder):
         )
 
     st.markdown("<div class='wrapped-divider'></div>", unsafe_allow_html=True)
-    st.markdown("<div class='wrapped-section-title'>Discussion dominante</div>", unsafe_allow_html=True)
+    st.markdown("<div class='wrapped-section-title'>Discussion la plus longue</div>", unsafe_allow_html=True)
     conversation = get_cached_mongo(repo, "top10-longest-conversation", lambda: get_ui_longest_conversation_summary(repo))
     if not conversation:
         render_placeholder(placeholder)
     else:
         summary_cols = st.columns(3)
         with summary_cols[0]:
-            render_stat("Taille", conversation.get("conversation_size", placeholder), "Q15")
+            render_stat("Volume", conversation.get("conversation_size", placeholder), "messages")
         with summary_cols[1]:
-            render_stat("Chaine max", conversation.get("longest_reply_chain_length", placeholder), "profondeur")
+            render_stat("Chaine max", conversation.get("longest_reply_chain_length", placeholder), "niveau de reponse")
         with summary_cols[2]:
-            render_stat("Fins", conversation.get("ending_tweet_count", placeholder), "branches")
+            render_stat("Fins", conversation.get("ending_tweet_count", placeholder), "branches finales")
         start_tweet = conversation.get("start_tweet")
         if start_tweet:
             render_tweet_card(start_tweet, placeholder, open_profile, open_replies, key_prefix="top10-conversation")
+            if st.button("Ouvrir la discussion", key="top10-open-longest-discussion"):
+                open_replies(start_tweet.get("tweet_id", ""))
+                st.rerun()
 
     render_slide_footer("Top 10")
 
 
 def render_search(repo, placeholder):
-    render_slide_header("Recherche", "Find anything", "Recherche utilisateur, hashtag ou texte dans le style d'une slide interactive.")
+    render_slide_header("Recherche", "Explorer", "Retrouvez un compte, un hashtag ou un message precis dans la conversation.")
 
     controls = st.columns([1, 1.8, 0.7])
     mode = controls[0].selectbox("Mode", ["Utilisateur", "Hashtag", "Texte"], index=["Utilisateur", "Hashtag", "Texte"].index(st.session_state.search_mode))
@@ -1250,7 +1330,7 @@ def render_search(repo, placeholder):
 
 
 def render_profile(repo, placeholder):
-    render_slide_header("Profil", "Creator focus", "Lecture profilee d'un compte et de ses tweets recents.")
+    render_slide_header("Profil", "Compte en lumiere", "Vue d'ensemble d'un compte et de ses publications les plus recentes.")
 
     selected_user = None
     if st.session_state.selected_username:
@@ -1305,7 +1385,7 @@ def render_profile(repo, placeholder):
 
 
 def render_hashtag(repo, placeholder):
-    render_slide_header("Hashtag", "Hashtag spotlight", "Questions 4 et 5 sur un hashtag choisi, avec quelques tweets pour contexte.")
+    render_slide_header("Hashtag", "Hashtag en vue", "Mesurez l'impact d'un hashtag et parcourez les messages qui l'ont fait vivre.")
 
     current_hashtag = st.session_state.selected_hashtag or "milano2026"
     entered_hashtag = st.text_input("Hashtag", value=current_hashtag, placeholder="milano2026")
@@ -1342,7 +1422,7 @@ def render_hashtag(repo, placeholder):
         <div class="wrapped-panel">
             <div class="wrapped-route-label">Hashtag selectionne</div>
             <div class="wrapped-title" style="font-size:2.3rem; text-transform:none;">#{normalized_hashtag}</div>
-            <div class="wrapped-subtitle">Synthese MongoDB des questions 4 et 5.</div>
+            <div class="wrapped-subtitle">Vue d'ensemble des conversations porteuses autour de ce hashtag.</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1350,9 +1430,9 @@ def render_hashtag(repo, placeholder):
 
     stat_cols = st.columns(2)
     with stat_cols[0]:
-        render_stat("Tweets", summary.get("tweet_count", placeholder), "Q4")
+        render_stat("Messages", summary.get("tweet_count", placeholder), "publications")
     with stat_cols[1]:
-        render_stat("Utilisateurs distincts", summary.get("user_count", placeholder), "Q5")
+        render_stat("Comptes distincts", summary.get("user_count", placeholder), "participants")
 
     st.markdown("<div class='wrapped-section-title'>Apercu des tweets correspondants</div>", unsafe_allow_html=True)
     if tweets == placeholder or not tweets:
@@ -1371,9 +1451,9 @@ def render_hashtag(repo, placeholder):
 
 
 def render_replies(repo, placeholder):
-    render_slide_header("Reponses", "Thread review", "Question 6 pour la liste globale, puis detail de conversation pour les threads.")
+    render_slide_header("Reponses", "Fil de discussion", "Suivez les reponses, le tweet parent et la conversation etendue autour d'un message.")
 
-    st.markdown("<div class='wrapped-section-title'>Q6 · Tous les tweets qui sont des reponses</div>", unsafe_allow_html=True)
+    st.markdown("<div class='wrapped-section-title'>Toutes les reponses recensees</div>", unsafe_allow_html=True)
     reply_tweets = get_cached_mongo(repo, "reply-tweets", lambda: get_ui_reply_tweets(repo))
     if reply_tweets == placeholder or not reply_tweets:
         render_placeholder(placeholder)
@@ -1443,25 +1523,61 @@ def render_replies(repo, placeholder):
     else:
         stat_cols = st.columns(4)
         with stat_cols[0]:
-            render_stat("Taille", conversation.get("conversation_size", placeholder), "Q14/Q16")
+            render_stat("Taille", conversation.get("conversation_size", placeholder), "messages relies")
         with stat_cols[1]:
-            render_stat("Chaine", conversation.get("longest_reply_chain_length", placeholder), "Q15")
+            render_stat("Chaine", conversation.get("longest_reply_chain_length", placeholder), "niveau max")
         with stat_cols[2]:
-            render_stat("Directes", conversation.get("direct_reply_count", placeholder), "a partir du debut")
+            render_stat("Directes", conversation.get("direct_reply_count", placeholder), "depuis le depart")
         with stat_cols[3]:
-            render_stat("Plus longue", "oui" if conversation.get("is_longest") else "non", "dataset global")
+            render_stat("Conversation phare", "oui" if conversation.get("is_longest") else "non", "sur toute la periode")
 
     render_slide_footer("Reponses")
 
 
 def render_network(placeholder):
-    render_slide_header("Reseau", "Social graph", "Questions 7 a 11 sur les relations de suivi dans Neo4j.")
+    render_slide_header("Reseau", "Graphe social", "Visualisez les liens de suivi et les comptes les plus connectes autour de MilanoOps.")
     graph_context = get_neo4j_context()
-    render_question_block("Q7", "Followers de MilanoOps", get_cached_neo4j("q7", lambda: get_ui_q7_followers(graph_context)), placeholder)
-    render_question_block("Q8", "Utilisateurs suivis par MilanoOps", get_cached_neo4j("q8", lambda: get_ui_q8_following(graph_context)), placeholder)
-    render_question_block("Q9", "Relations reciproques avec MilanoOps", get_cached_neo4j("q9", lambda: get_ui_q9_mutual_connections(graph_context)), placeholder)
-    render_question_block("Q10", "Utilisateurs avec plus de 10 followers", get_cached_neo4j("q10", lambda: get_ui_q10_users_with_more_than_ten_followers(graph_context)), placeholder)
-    render_question_block("Q11", "Utilisateurs qui suivent plus de 5 utilisateurs", get_cached_neo4j("q11", lambda: get_ui_q11_users_following_more_than_five_users(graph_context)), placeholder)
+    q7 = get_cached_neo4j("q7", lambda: get_ui_q7_followers(graph_context))
+    q8 = get_cached_neo4j("q8", lambda: get_ui_q8_following(graph_context))
+    q9 = get_cached_neo4j("q9", lambda: get_ui_q9_mutual_connections(graph_context))
+    q10 = get_cached_neo4j("q10", lambda: get_ui_q10_users_with_more_than_ten_followers(graph_context))
+    q11 = get_cached_neo4j("q11", lambda: get_ui_q11_users_following_more_than_five_users(graph_context))
+
+    stat_cols = st.columns(3)
+    with stat_cols[0]:
+        render_stat("Followers MilanoOps", len(q7) if q7 != placeholder else placeholder, "comptes")
+    with stat_cols[1]:
+        render_stat("Suivis MilanoOps", len(q8) if q8 != placeholder else placeholder, "comptes")
+    with stat_cols[2]:
+        render_stat("Relations reciproques", len(q9) if q9 != placeholder else placeholder, "liens mutuels")
+
+    first_row = st.columns(3)
+    with first_row[0]:
+        render_user_result_cards("Followers de MilanoOps", q7, placeholder)
+    with first_row[1]:
+        render_user_result_cards("Comptes suivis par MilanoOps", q8, placeholder)
+    with first_row[2]:
+        render_user_result_cards("Liens reciproques", q9, placeholder)
+
+    st.markdown("<div class='wrapped-divider'></div>", unsafe_allow_html=True)
+
+    second_row = st.columns(2)
+    with second_row[0]:
+        render_user_result_cards(
+            "Plus de 10 followers",
+            q10,
+            placeholder,
+            count_key="follower_count",
+            count_label="followers",
+        )
+    with second_row[1]:
+        render_user_result_cards(
+            "Suit plus de 5 utilisateurs",
+            q11,
+            placeholder,
+            count_key="following_count",
+            count_label="suivis",
+        )
     render_slide_footer("Reseau")
 
 
@@ -1480,6 +1596,7 @@ def run_streamlit_ui():
     transition_direction = st.session_state.transition_direction
     apply_styles(dev_mode=os.getenv("APP_MILANO_UI_MODE") != "desktop", transition_direction=transition_direction)
     st.session_state.transition_direction = "none"
+    render_keyboard_navigation()
     repo = get_mongo_context()
 
     try:

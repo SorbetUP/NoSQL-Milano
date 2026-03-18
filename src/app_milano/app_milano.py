@@ -45,7 +45,7 @@ class AppMilano:
         except (PyMongoError, Neo4jError, subprocess.CalledProcessError) as exc:
             raise SystemExit(str(exc)) from exc
 
-    def _run(self) -> None:
+    def bootstrap(self):
         require_docker()
         start_services()
 
@@ -87,6 +87,9 @@ class AppMilano:
         )
         neo4j_driver.close()
         mongo_client.close()
+        return question_results
 
+    def _run(self) -> None:
+        question_results = self.bootstrap()
         print_connection_info(self.settings)
         print_question_results(question_results)
