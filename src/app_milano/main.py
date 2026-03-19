@@ -16,7 +16,6 @@ def main() -> None:
     load_env_file()
     if "--cli" in sys.argv:
         AppMilano().run()
-        return
 
     from app_milano.utils.display import launch_desktop
 
