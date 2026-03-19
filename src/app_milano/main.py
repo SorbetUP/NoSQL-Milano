@@ -18,7 +18,6 @@ def main() -> None:
         AppMilano().run()
         return
 
-    AppMilano().bootstrap()
     from app_milano.utils.display import launch_desktop
 
     launch_desktop()
