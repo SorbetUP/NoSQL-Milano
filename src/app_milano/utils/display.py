@@ -1,4 +1,5 @@
 import atexit
+import html
 import os
 import socket
 import subprocess
@@ -1093,6 +1094,107 @@ def render_user_result_cards(title, rows, placeholder, count_key=None, count_lab
         )
 
 
+def render_milanoops_graph(followers, following, mutuals, placeholder):
+    st.markdown("<div class='wrapped-section-title'>Graphe des relations de MilanoOps</div>", unsafe_allow_html=True)
+    if followers == placeholder or following == placeholder or mutuals == placeholder:
+        render_placeholder(placeholder)
+        return
+
+    followers = followers or []
+    following = following or []
+    mutual_usernames = {row.get("username", "") for row in mutuals or []}
+
+    width = 900
+    node_width = 170
+    node_height = 36
+    row_gap = 54
+    top_padding = 38
+    left_x = 36
+    right_x = width - node_width - 36
+    center_x = (width - node_width) / 2
+    max_rows = max(len(followers), len(following), 1)
+    center_y = top_padding + ((max_rows - 1) * row_gap) / 2
+    height = int(max(280, top_padding * 2 + max_rows * row_gap + 40))
+
+    def layout(rows):
+        if not rows:
+            return []
+        total_span = (len(rows) - 1) * row_gap
+        start_y = center_y - total_span / 2
+        return [start_y + index * row_gap for index in range(len(rows))]
+
+    def node_color(username, base_color):
+        return "#d95d39" if username in mutual_usernames else base_color
+
+    left_nodes = []
+    left_edges = []
+    for row, y in zip(followers, layout(followers)):
+        username = row.get("username", "unknown")
+        fill = node_color(username, "#2a9d8f")
+        left_nodes.append(
+            f"""
+            <rect x="{left_x}" y="{y}" width="{node_width}" height="{node_height}" rx="16" fill="{fill}" stroke="#f7efe5" stroke-width="1.2" />
+            <text x="{left_x + node_width / 2}" y="{y + 22}" text-anchor="middle" fill="#f7efe5" font-size="13" font-family="Verdana, sans-serif">
+                {html.escape(username)}
+            </text>
+            """
+        )
+        left_edges.append(
+            f"""
+            <line x1="{left_x + node_width}" y1="{y + node_height / 2}" x2="{center_x}" y2="{center_y + node_height / 2}" stroke="{fill}" stroke-width="2.2" marker-end="url(#milano-arrow)" opacity="0.9" />
+            """
+        )
+
+    right_nodes = []
+    right_edges = []
+    for row, y in zip(following, layout(following)):
+        username = row.get("username", "unknown")
+        fill = node_color(username, "#e9c46a")
+        right_nodes.append(
+            f"""
+            <rect x="{right_x}" y="{y}" width="{node_width}" height="{node_height}" rx="16" fill="{fill}" stroke="#2b2118" stroke-width="1.2" />
+            <text x="{right_x + node_width / 2}" y="{y + 22}" text-anchor="middle" fill="#2b2118" font-size="13" font-family="Verdana, sans-serif">
+                {html.escape(username)}
+            </text>
+            """
+        )
+        right_edges.append(
+            f"""
+            <line x1="{center_x + node_width}" y1="{center_y + node_height / 2}" x2="{right_x}" y2="{y + node_height / 2}" stroke="{fill}" stroke-width="2.2" marker-end="url(#milano-arrow)" opacity="0.9" />
+            """
+        )
+
+    center_node = f"""
+        <rect x="{center_x}" y="{center_y}" width="{node_width}" height="{node_height}" rx="18" fill="#1f2f38" stroke="#ff6b57" stroke-width="2.4" />
+        <text x="{center_x + node_width / 2}" y="{center_y + 22}" text-anchor="middle" fill="#f7efe5" font-size="14" font-family="Verdana, sans-serif" font-weight="700">
+            MilanoOps
+        </text>
+    """
+
+    graph_html = f"""
+    <div style="background:linear-gradient(160deg,#1b1916 0%,#26231d 100%);border:1px solid rgba(247,239,229,0.12);border-radius:24px;padding:18px 18px 10px 18px;">
+        <div style="display:flex;gap:12px;flex-wrap:wrap;margin:0 0 14px 6px;font-family:Verdana,sans-serif;font-size:12px;color:#f7efe5;">
+            <span style="display:flex;align-items:center;gap:6px;"><span style="width:12px;height:12px;border-radius:999px;background:#2a9d8f;display:inline-block;"></span> Followers</span>
+            <span style="display:flex;align-items:center;gap:6px;"><span style="width:12px;height:12px;border-radius:999px;background:#e9c46a;display:inline-block;"></span> Suivis par MilanoOps</span>
+            <span style="display:flex;align-items:center;gap:6px;"><span style="width:12px;height:12px;border-radius:999px;background:#d95d39;display:inline-block;"></span> Relation reciproque</span>
+        </div>
+        <svg viewBox="0 0 {width} {height}" width="100%" height="{height}" role="img" aria-label="Graphe des relations de MilanoOps">
+            <defs>
+                <marker id="milano-arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+                    <path d="M0,0 L0,6 L8,3 z" fill="#f7efe5"></path>
+                </marker>
+            </defs>
+            {"".join(left_edges)}
+            {"".join(right_edges)}
+            {center_node}
+            {"".join(left_nodes)}
+            {"".join(right_nodes)}
+        </svg>
+    </div>
+    """
+    components.html(graph_html, height=height + 55, scrolling=False)
+
+
 def render_dark_activity_chart(activity_rows):
     values = []
     for index, row in enumerate(activity_rows):
@@ -1542,6 +1644,8 @@ def render_network(placeholder):
     q9 = get_cached_neo4j("q9", lambda: get_ui_q9_mutual_connections(graph_context))
     q10 = get_cached_neo4j("q10", lambda: get_ui_q10_users_with_more_than_ten_followers(graph_context))
     q11 = get_cached_neo4j("q11", lambda: get_ui_q11_users_following_more_than_five_users(graph_context))
+
+    render_milanoops_graph(q7, q8, q9, placeholder)
 
     stat_cols = st.columns(3)
     with stat_cols[0]:

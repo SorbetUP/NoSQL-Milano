@@ -164,21 +164,6 @@ def get_users_following_more_than_five_users(driver: Driver) -> list[dict]:
         return [record.data() for record in result]
 
 
-# Question 14: tweets qui initient une discussion
-def get_thread_starters(driver: Driver) -> list[dict]:
-    pass
-
-
-# Question 15: discussion la plus longue
-def get_longest_discussion(driver: Driver) -> dict:
-    pass
-
-
-# Question 16: debut et fin de chaque conversation
-def get_conversation_start_and_end(driver: Driver) -> list[dict]:
-    pass
-
-
 def create_neo4j_context(placeholder="Indisponible"):
     context = {
         "placeholder": placeholder,
